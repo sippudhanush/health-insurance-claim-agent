@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import List, Optional
 from pydantic import BaseModel
 from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
@@ -56,7 +57,7 @@ async def detect_fraud(items: str) -> str:
     agent = Agent(
         name="FraudDetector",
         instructions=INSTRUCTIONS,
-        model="gpt-4o-mini",
+        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
         output_type=AgentOutputSchema(FraudCheckOut, strict_json_schema=False),
         model_settings=ModelSettings(reasoning={"effort": "low"}),
     )

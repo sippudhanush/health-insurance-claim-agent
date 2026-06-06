@@ -84,7 +84,7 @@ Never fail whole doc because one field is unclear.
 async def extract_with_vision(base64_content: str, doc_type: str) -> str:
     client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
         messages=[
             {
                 "role": "user",
@@ -119,7 +119,7 @@ async def extract_documents(items: str) -> str:
     agent = Agent(
         name="DocumentExtractor",
         instructions=INSTRUCTIONS,
-        model="gpt-4o-mini",
+        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
         tools=[extract_with_vision],
         output_type=AgentOutputSchema(ExtractionOut, strict_json_schema=False),
         model_settings=ModelSettings(reasoning={"effort": "low"}),

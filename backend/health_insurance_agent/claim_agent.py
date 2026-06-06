@@ -12,7 +12,7 @@ from agents.tracing import add_trace_processor
 from agents.tracing.processors import ConsoleSpanExporter, BatchTraceProcessor
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 
-from health_insurance_agent.tools.document_verifier import verify_documents
+from health_insurance_agent.tools.document_verifier import verify_documents, _run_verification as verify_documents_direct
 from health_insurance_agent.tools.document_extractor import extract_documents
 from health_insurance_agent.tools.policy_checker import check_policy
 from health_insurance_agent.tools.fraud_detector import detect_fraud
@@ -139,6 +139,33 @@ async def process_claim(claim_data: Dict[str, Any]) -> Dict[str, Any]:
 
     with trace("Health Insurance Claim Processing", group_id=claim_id):
         logger.info("Processing claim: %s", claim_id)
+
+        # Pre-verify documents before invoking the orchestrator agent
+        try:
+            doc_verification_raw = await verify_documents_direct(json.dumps(payload, ensure_ascii=False))
+            doc_verification = json.loads(doc_verification_raw)
+            if not doc_verification.get("overall_valid", True):
+                logger.warning("Document verification failed for %s — short-circuiting", claim_id)
+                missing = doc_verification.get("missing_docs", [])
+                wrong = doc_verification.get("wrong_docs", [])
+                reasons = []
+                if missing:
+                    reasons.append(f"Missing required documents: {', '.join(missing)}")
+                if wrong:
+                    reasons.append(f"Incorrect document types: {', '.join(wrong)}")
+                return ClaimOut(
+                    claim_id=claim_id,
+                    decision="REJECTED",
+                    approved_amount=None,
+                    confidence_score=0.95,
+                    rejection_reasons=reasons,
+                    reasoning="Document verification failed. Required documents are missing or invalid.",
+                    line_item_breakdown=None,
+                    degradation_notes=[],
+                ).model_dump()
+        except Exception as e:
+            logger.warning("Pre-verification failed for %s: %s — continuing to agent", claim_id, e)
+
         agent = build_agent()
         try:
             res = await Runner.run(

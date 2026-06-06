@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import List, Optional
 from pydantic import BaseModel
 from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
@@ -78,7 +79,7 @@ async def check_policy(items: str) -> str:
     agent = Agent(
         name="PolicyChecker",
         instructions=INSTRUCTIONS,
-        model="gpt-4o-mini",
+        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
         output_type=AgentOutputSchema(PolicyCheckOut, strict_json_schema=False),
         model_settings=ModelSettings(reasoning={"effort": "low"}),
     )

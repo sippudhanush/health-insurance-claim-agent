@@ -64,7 +64,7 @@ async def classify_document_with_vision(base64_content: str) -> str:
 
     client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
         messages=[
             {
                 "role": "user",
@@ -137,13 +137,18 @@ Final output JSON:
 
 @function_tool
 async def verify_documents(items: str) -> str:
+    return await _run_verification(items)
+
+
+async def _run_verification(items: str) -> str:
+    """Directly callable verification (not a function_tool)."""
     raw = json.loads(items) if isinstance(items, str) else (items or {})
     items_list = raw.get("documents", raw) if isinstance(raw, dict) else raw
 
     agent = Agent(
         name="DocumentVerifier",
         instructions=INSTRUCTIONS,
-        model="gpt-4o-mini",
+        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
         tools=[classify_document_with_vision],
         output_type=AgentOutputSchema(DocVerificationOut, strict_json_schema=False),
         model_settings=ModelSettings(reasoning={"effort": "low"}),
