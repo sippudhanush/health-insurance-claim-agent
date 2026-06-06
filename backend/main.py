@@ -12,14 +12,8 @@ from core.database import get_db, init_db
 from schemas.claim import ClaimInput
 from schemas.decision import DecisionResponse, TraceResponse
 
-from agents.extraction_agent import ExtractionAgent
-from agents.validation_agent import ValidationAgent
-from agents.policy_agent import PolicyAgent
-from agents.fraud_agent import FraudAgent
-from agents.decision_agent import DecisionEngineAgent
-
 from models import Claim, FileStatus
-from services.langfuse_client import langfuse
+from agents.orchestrator import OrchestratorAgent
 
 
 @asynccontextmanager
@@ -33,148 +27,33 @@ app = FastAPI(title="Plum Claims Processing System", version="1.0.0", lifespan=l
 
 async def claim_stream(input_data: ClaimInput, db: AsyncSession, claim: Claim):
     try:
-        root_trace = langfuse.trace(
-            id=claim.id,
-            name="claim-processing",
-            input={
-                "member_id": input_data.member_id,
-                "category": input_data.claim_category,
-                "claimed_amount": input_data.claimed_amount,
-            },
-        ) if langfuse else None
+        orchestrator = OrchestratorAgent(db, claim.id, input_data)
+        async for event in orchestrator.process():
+            if event["event"] == "result":
+                data = json.loads(event["data"])
+                claim.status = data.get("decision", "ERROR")
+                claim.decision = data.get("decision")
+                claim.approved_amount = data.get("approved_amount")
+                claim.confidence_score = data.get("confidence_score")
+                claim.rejection_reasons = data.get("rejection_reasons", [])
+                claim.trace = data.get("trace", {})
+                db.add(claim)
+                await db.flush()
 
-        # Stream opened — notify client with claim_id
-        yield {"event": "start", "data": json.dumps({"claim_id": claim.id, "status": "PROCESSING"})}
+                for d in input_data.documents:
+                    db.add(FileStatus(
+                        claim_id=claim.id,
+                        file_uuid=d.file_id,
+                        original_name=d.file_name or d.file_id,
+                        actual_type=d.actual_type or "UNKNOWN",
+                    ))
+                await db.flush()
+            elif event["event"] == "error":
+                claim.status = "ERROR"
+                db.add(claim)
+                await db.flush()
 
-        # Stage 1: Light Extraction
-        yield {"event": "progress", "data": json.dumps({"step": "extraction", "status": "running"})}
-        extraction_agent = ExtractionAgent(db)
-        doc_dicts = [d.model_dump() for d in input_data.documents]
-        light_results = await extraction_agent.light_extract(claim.id, doc_dicts)
-        if root_trace:
-            root_trace.span(name="light_extraction", output={"document_count": len(light_results)})
-        yield {"event": "progress", "data": json.dumps({"step": "extraction", "status": "done", "files": len(light_results)})}
-
-        # Stage 2: Document Validation (early exit for doc problems)
-        yield {"event": "progress", "data": json.dumps({"step": "validation", "status": "running"})}
-        validation_agent = ValidationAgent()
-        validation_result = validation_agent.validate(input_data.claim_category, light_results)
-
-        if not validation_result.valid:
-            claim.status = "DOCUMENT_ERROR"
-            db.add(claim)
-            await db.flush()
-            if root_trace:
-                root_trace.span(name="validation", output={"status": "FAILED", "errors": [e.code for e in validation_result.errors]})
-            if langfuse:
-                langfuse.flush()
-            if validation_result.errors:
-                err = validation_result.errors[0]
-                yield {"event": "error", "data": json.dumps({"code": err.code, "message": err.message, "details": err.details, "claim_id": claim.id})}
-                yield {"event": "done", "data": "{}"}
-                return
-
-        if root_trace:
-            root_trace.span(name="validation", output={"status": "PASSED"})
-        yield {"event": "progress", "data": json.dumps({"step": "validation", "status": "passed"})}
-
-        # Stage 3: Deep Extraction
-        yield {"event": "progress", "data": json.dumps({"step": "deep_extraction", "status": "running"})}
-        deep_results = await extraction_agent.deep_extract(
-            claim.id,
-            [
-                {
-                    "file_id": r.file_id,
-                    "detected_type": r.detected_type,
-                    "quality": r.quality,
-                    "actual_type": d.actual_type,
-                    "content": d.content,
-                    "file_name": d.file_name,
-                }
-                for r, d in zip(light_results, input_data.documents)
-            ],
-        )
-        deep_status = "degraded" if extraction_agent.degraded else "done"
-        if root_trace:
-            root_trace.span(name="deep_extraction", output={"document_count": len(deep_results), "degraded": extraction_agent.degraded})
-        yield {"event": "progress", "data": json.dumps({"step": "deep_extraction", "status": deep_status})}
-
-        for d in input_data.documents:
-            db.add(FileStatus(
-                claim_id=claim.id,
-                file_uuid=d.file_id,
-                original_name=d.file_name or d.file_id,
-                actual_type=d.actual_type or "UNKNOWN",
-            ))
-        await db.flush()
-
-        # Stage 4: Policy Evaluation
-        yield {"event": "progress", "data": json.dumps({"step": "policy", "status": "running"})}
-        policy_agent = PolicyAgent(db)
-        policy_result = await policy_agent.evaluate(
-            claim_id=claim.id,
-            member_id=input_data.member_id,
-            category=input_data.claim_category,
-            claimed_amount=input_data.claimed_amount,
-            treatment_date=input_data.treatment_date,
-            hospital_name=input_data.hospital_name,
-            extracted_docs=deep_results,
-            ytd_claims_amount=input_data.ytd_claims_amount,
-        )
-        if root_trace:
-            root_trace.span(name="policy_evaluation", output={"eligible": policy_result.eligible})
-        if policy_result.eligible:
-            yield {"event": "progress", "data": json.dumps({"step": "policy", "status": "passed"})}
-        else:
-            yield {"event": "progress", "data": json.dumps({"step": "policy", "status": "rejected", "reasons": policy_result.rejection_reasons})}
-
-        # Stage 5: Fraud Detection
-        yield {"event": "progress", "data": json.dumps({"step": "fraud", "status": "running"})}
-        fraud_agent = FraudAgent(db)
-        fraud_result = await fraud_agent.detect(
-            claim_id=claim.id,
-            member_id=input_data.member_id,
-            claimed_amount=input_data.claimed_amount,
-            treatment_date=input_data.treatment_date,
-            claims_history=input_data.claims_history,
-        )
-        if root_trace:
-            root_trace.span(name="fraud_detection", output={"fraud_score": fraud_result.fraud_score})
-        if fraud_result.fraud_score >= 0.8:
-            yield {"event": "progress", "data": json.dumps({"step": "fraud", "status": "flagged", "score": fraud_result.fraud_score})}
-        else:
-            yield {"event": "progress", "data": json.dumps({"step": "fraud", "status": "passed", "score": fraud_result.fraud_score})}
-
-        # Stage 6: Decision Engine
-        yield {"event": "progress", "data": json.dumps({"step": "decision", "status": "running"})}
-        decision_agent = DecisionEngineAgent(db)
-        decision_output = await decision_agent.decide(
-            claim_id=claim.id,
-            validation_result=validation_result,
-            extracted_docs=deep_results,
-            policy_result=policy_result,
-            fraud_result=fraud_result,
-            extraction_agent=extraction_agent,
-            claimed_amount=input_data.claimed_amount,
-        )
-
-        claim.status = decision_output.decision
-        claim.decision = decision_output.decision
-        claim.approved_amount = decision_output.approved_amount
-        claim.confidence_score = decision_output.confidence_score
-        claim.rejection_reasons = decision_output.rejection_reasons
-        claim.trace = decision_output.trace
-        db.add(claim)
-        await db.flush()
-
-        if root_trace:
-            root_trace.span(name="decision", output={"decision": decision_output.decision, "approved_amount": decision_output.approved_amount})
-            root_trace.update(output={"status": decision_output.decision, "claim_id": claim.id})
-        if langfuse:
-            langfuse.flush()
-
-        yield {"event": "result", "data": decision_output.model_dump_json()}
-        yield {"event": "done", "data": "{}"}
+            yield event
 
     except Exception as e:
         yield {"event": "error", "data": json.dumps({"message": str(e)})}

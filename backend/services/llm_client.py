@@ -40,10 +40,28 @@ class GroqClient:
         self.model = settings.groq_model
         self.client = AsyncClient(timeout=30.0)
 
-    async def _call(self, prompt: str, content: str) -> str:
+    async def _call(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | None = None,
+        max_tokens: int = 2000,
+    ) -> dict:
         if not self.api_key:
             raise ValueError("GROQ_API_KEY not configured")
-        logger.info("Groq API request — model=%s content_len=%d", self.model, len(content))
+        content_len = sum(len(m.get("content", "") or "") for m in messages)
+        logger.info("Groq API request — model=%s messages=%d content_len=%d", self.model, len(messages), content_len)
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            body["tools"] = tools
+        if tool_choice:
+            body["tool_choice"] = tool_choice
+
         start = __import__("time").time()
         resp = await self.client.post(
             GROQ_API_BASE,
@@ -51,27 +69,30 @@ class GroqClient:
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": content},
-                ],
-                "temperature": 0.1,
-                "max_tokens": 2000,
-            },
+            json=body,
         )
         resp.raise_for_status()
         data = resp.json()
         elapsed = __import__("time").time() - start
-        content_out = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]["message"]
         logger.info(
-            "Groq API response — elapsed=%.2fs tokens=%d output_len=%d",
+            "Groq API response — elapsed=%.2fs tokens=%d tool_calls=%s",
             elapsed,
             data.get("usage", {}).get("total_tokens", 0),
-            len(content_out),
+            bool(choice.get("tool_calls")),
         )
-        return content_out
+        return choice
+
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None, max_tokens: int = 2000) -> dict:
+        return await self._call(messages, tools=tools, max_tokens=max_tokens)
+
+    async def _call_prompt(self, prompt: str, content: str) -> str:
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": content},
+        ]
+        choice = await self._call(messages)
+        return choice.get("content", "")
 
     async def light_extract(self, file_description: str, trace_id: str | None = None) -> dict:
         span = langfuse.span(
@@ -80,7 +101,7 @@ class GroqClient:
             input={"file_description": file_description},
         ) if trace_id and langfuse else None
         try:
-            raw = await self._call(LIGHT_EXTRACTION_PROMPT, file_description)
+            raw = await self._call_prompt(LIGHT_EXTRACTION_PROMPT, file_description)
             result = json.loads(raw)
             logger.info("light_extract parsed — type=%s confidence=%s", result.get("detected_type"), result.get("confidence"))
             if span:
@@ -105,7 +126,7 @@ class GroqClient:
             input={"doc_type": doc_type, "file_content": file_content},
         ) if trace_id and langfuse else None
         try:
-            raw = await self._call(prompt, file_content)
+            raw = await self._call_prompt(prompt, file_content)
             result = json.loads(raw)
             logger.info("deep_extract parsed — doc_type=%s fields=%s", doc_type, list(result.keys()))
             if span:
