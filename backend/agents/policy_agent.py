@@ -3,7 +3,7 @@ from datetime import date, datetime
 from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.decision import PolicyCheck
+from models import PolicyCheck
 from schemas.decision import PolicyResult, PolicyCheckResult
 from core.enums import RejectionReason
 

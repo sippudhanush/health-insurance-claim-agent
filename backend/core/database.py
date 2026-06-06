@@ -25,8 +25,6 @@ async def get_db() -> AsyncSession:
 
 async def init_db():
     async with engine.begin() as conn:
-        from models.claim import Claim  # noqa: F401
-        from models.document import Document  # noqa: F401
-        from models.decision import DecisionRecord, PolicyCheck, FraudCheck  # noqa: F401
+        from models import Claim, Document, PolicyCheck, FraudCheck, DecisionRecord, FileStatus  # noqa: F401
 
         await conn.run_sync(Base.metadata.create_all)

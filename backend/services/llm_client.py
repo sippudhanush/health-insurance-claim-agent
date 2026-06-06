@@ -1,7 +1,10 @@
 import json
+import logging
 from httpx import AsyncClient
 from core.config import settings
 from services.langfuse_client import langfuse
+
+logger = logging.getLogger("plum.llm")
 
 GROQ_API_BASE = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -40,6 +43,8 @@ class GroqClient:
     async def _call(self, prompt: str, content: str) -> str:
         if not self.api_key:
             raise ValueError("GROQ_API_KEY not configured")
+        logger.info("Groq API request — model=%s content_len=%d", self.model, len(content))
+        start = __import__("time").time()
         resp = await self.client.post(
             GROQ_API_BASE,
             headers={
@@ -58,21 +63,36 @@ class GroqClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        elapsed = __import__("time").time() - start
+        content_out = data["choices"][0]["message"]["content"]
+        logger.info(
+            "Groq API response — elapsed=%.2fs tokens=%d output_len=%d",
+            elapsed,
+            data.get("usage", {}).get("total_tokens", 0),
+            len(content_out),
+        )
+        return content_out
 
     async def light_extract(self, file_description: str, trace_id: str | None = None) -> dict:
         span = langfuse.span(
             name="light_extract",
             trace_id=trace_id,
             input={"file_description": file_description},
-        ) if trace_id else None
+        ) if trace_id and langfuse else None
         try:
             raw = await self._call(LIGHT_EXTRACTION_PROMPT, file_description)
             result = json.loads(raw)
+            logger.info("light_extract parsed — type=%s confidence=%s", result.get("detected_type"), result.get("confidence"))
             if span:
                 span.end(output=result)
             return result
+        except json.JSONDecodeError as e:
+            logger.error("light_extract JSON parse failed — raw=%s error=%s", raw[:200], e)
+            if span:
+                span.end(level="ERROR", output={"error": str(e)})
+            raise
         except Exception as e:
+            logger.error("light_extract failed — error=%s", e)
             if span:
                 span.end(level="ERROR", output={"error": str(e)})
             raise
@@ -83,14 +103,21 @@ class GroqClient:
             name="deep_extract",
             trace_id=trace_id,
             input={"doc_type": doc_type, "file_content": file_content},
-        ) if trace_id else None
+        ) if trace_id and langfuse else None
         try:
             raw = await self._call(prompt, file_content)
             result = json.loads(raw)
+            logger.info("deep_extract parsed — doc_type=%s fields=%s", doc_type, list(result.keys()))
             if span:
                 span.end(output=result)
             return result
+        except json.JSONDecodeError as e:
+            logger.error("deep_extract JSON parse failed — raw=%s error=%s", raw[:200], e)
+            if span:
+                span.end(level="ERROR", output={"error": str(e)})
+            raise
         except Exception as e:
+            logger.error("deep_extract failed — doc_type=%s error=%s", doc_type, e)
             if span:
                 span.end(level="ERROR", output={"error": str(e)})
             raise

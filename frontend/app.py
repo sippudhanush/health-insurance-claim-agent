@@ -2,10 +2,22 @@ import streamlit as st
 import httpx
 import json
 import uuid
+from pathlib import Path
 from datetime import date
 import os
 
 API_BASE = os.getenv("API_BASE", "http://backend:8000")
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "files")))
+
+
+def save_uploaded_file(uploaded_file) -> str:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    ext = Path(uploaded_file.name).suffix
+    stored_name = f"{uuid.uuid4().hex}{ext}"
+    path = UPLOAD_DIR / stored_name
+    path.write_bytes(uploaded_file.getvalue())
+    return stored_name
 
 
 def fetch_policy():
@@ -107,6 +119,8 @@ with tab1:
                 "actual_type": doc_type,
             }
             if uploaded:
+                stored_name = save_uploaded_file(uploaded)
+                doc["file_id"] = stored_name
                 doc["file_name"] = uploaded.name
             documents.append(doc)
 
@@ -116,26 +130,116 @@ with tab1:
             "claim_category": claim_category,
             "treatment_date": treatment_date.isoformat(),
             "claimed_amount": claimed_amount,
-            "hospital_name": hospital_name or None,
             "documents": documents,
         }
 
-        with st.spinner("Processing claim through pipeline..."):
-            try:
-                resp = httpx.post(f"{API_BASE}/api/claims", json=payload, timeout=60.0)
-                if resp.status_code == 422:
-                    err = resp.json()["detail"]
-                    st.markdown(f'<div class="error-msg"><strong>{err["code"]}</strong><br>{err["message"]}</div>', unsafe_allow_html=True)
-                    if err.get("details"):
-                        st.json(err["details"])
-                elif resp.status_code == 200:
-                    result = resp.json()
-                    st.success(f"Claim {result['claim_id']} processed successfully!")
-                    st.session_state["last_claim_id"] = result["claim_id"]
-                else:
-                    st.error(f"Error: {resp.status_code} - {resp.text}")
-            except Exception as e:
-                st.error(f"Connection error: {e}")
+        progress_bar = st.progress(0, text="Starting...")
+        status_text = st.empty()
+        result_container = st.empty()
+        error_container = st.empty()
+        result_data = None
+
+        try:
+            with httpx.stream("POST", f"{API_BASE}/api/claims", json=payload, timeout=120.0, headers={"Accept": "text/event-stream"}) as resp:
+                event = None
+                data_parts = []
+                steps = ["extraction", "validation", "deep_extraction", "policy", "fraud", "decision"]
+                step_idx = 0
+
+                for line in resp.iter_lines():
+                    if line.startswith("event: "):
+                        event = line[7:]
+                    elif line.startswith("data: "):
+                        data_parts.append(line[6:])
+                    elif line == "" and event is not None:
+                        data_str = "\n".join(data_parts)
+                        if data_str:
+                            parsed = json.loads(data_str)
+                            if event == "start":
+                                progress_bar.progress(0, text=f"Claim {parsed.get('claim_id', '')} — processing...")
+                                status_text.info(parsed.get("status", "PROCESSING"))
+
+                            elif event == "progress":
+                                step = parsed.get("step", "")
+                                status = parsed.get("status", "")
+                                files = parsed.get("files")
+                                score = parsed.get("score")
+                                reasons = parsed.get("reasons")
+                                msg = f"[{step}] {status}"
+                                if files is not None:
+                                    msg += f" ({files} files)"
+                                if score is not None:
+                                    msg += f" score={score}"
+                                if reasons:
+                                    msg += f" reasons={reasons}"
+
+                                if status == "running":
+                                    step_idx = steps.index(step) if step in steps else step_idx
+                                    progress_bar.progress(step_idx / len(steps), text=msg)
+                                    status_text.info(msg)
+                                elif status in ("done", "passed"):
+                                    progress_bar.progress((step_idx + 1) / len(steps), text=msg)
+                                    status_text.success(msg)
+                                    step_idx += 1
+                                elif status in ("failed", "rejected", "degraded"):
+                                    progress_bar.progress(1.0, text=msg)
+                                    status_text.warning(msg)
+                                elif status == "flagged":
+                                    progress_bar.progress((step_idx + 1) / len(steps), text=msg)
+                                    status_text.warning(msg)
+                                    step_idx += 1
+
+                            elif event == "error":
+                                code = parsed.get("code", "")
+                                message = parsed.get("message", "Unknown error")
+                                details = parsed.get("details")
+                                progress_bar.progress(1.0, text="Failed")
+                                status_text.error(f"[{code}] {message}")
+                                if details:
+                                    error_container.json(details)
+
+                            elif event == "result":
+                                result_data = parsed
+
+                            elif event == "done":
+                                progress_bar.progress(1.0, text="Complete")
+                                if result_data:
+                                    decision = result_data.get("decision", "")
+                                    css_class = {
+                                        "APPROVED": "approved", "PARTIAL": "partial",
+                                        "REJECTED": "rejected", "MANUAL_REVIEW": "manual",
+                                    }.get(decision, "")
+                                    with result_container.container():
+                                        st.markdown(f"### Decision: <span class='{css_class}'>{decision}</span>", unsafe_allow_html=True)
+                                        st.session_state["last_claim_id"] = result_data.get("claim_id", "")
+                                        col1, col2, col3 = st.columns(3)
+                                        with col1:
+                                            st.metric("Approved Amount", f"₹{result_data.get('approved_amount', 0):,.2f}" if result_data.get('approved_amount') else "₹0.00")
+                                        with col2:
+                                            st.metric("Confidence", f"{result_data.get('confidence_score', 0):.2%}")
+                                        with col3:
+                                            if result_data.get("rejection_reasons"):
+                                                st.metric("Rejection Reasons", ", ".join(result_data["rejection_reasons"]))
+                                        if result_data.get("line_item_breakdown"):
+                                            st.subheader("Line Item Breakdown")
+                                            breakdown = result_data["line_item_breakdown"]
+                                            if breakdown and isinstance(breakdown, list):
+                                                st.table(breakdown)
+                                        if result_data.get("trace"):
+                                            st.subheader("Full Trace")
+                                            with st.expander("View decision trace", expanded=True):
+                                                st.json(result_data["trace"])
+                                        if result_data.get("degradation_notes"):
+                                            st.warning("Degradation Notes:")
+                                            for note in result_data["degradation_notes"]:
+                                                st.write(f"- {note}")
+                                break
+
+                        event = None
+                        data_parts = []
+
+        except Exception as e:
+            st.error(f"Connection error: {e}")
 
 with tab2:
     claim_id = st.text_input("Enter Claim ID", value=st.session_state.get("last_claim_id", ""))

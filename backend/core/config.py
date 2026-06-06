@@ -1,7 +1,18 @@
 import os
+import logging
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+dotenv_path = Path(__file__).resolve().parent.parent.parent / ".env"
+load_dotenv(dotenv_path=dotenv_path)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)-24s | %(levelname)-5s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("plum")
 
 
 class Settings:

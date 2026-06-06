@@ -2,9 +2,8 @@ from datetime import date
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, Date
 
-from models.claim import Claim
+from models import Claim, FraudCheck
 from schemas.decision import FraudResult
-from models.decision import FraudCheck
 
 
 class FraudAgent:

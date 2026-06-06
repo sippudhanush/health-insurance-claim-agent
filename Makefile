@@ -1,4 +1,4 @@
-.PHONY: up down build logs format lint test clean
+.PHONY: up down build logs format lint test clean migrations migrate migration-local migrate-local
 
 # Docker commands
 up:
@@ -41,3 +41,17 @@ rebuild:
 	docker compose down
 	docker compose build --no-cache
 	docker compose up
+
+# Database migrations (Docker)
+migrations:
+	docker compose exec backend alembic revision --autogenerate -m "$(name)"
+
+migrate:
+	docker compose exec backend alembic upgrade head
+
+# Database migrations (local)
+migrations-local:
+	cd backend && alembic revision --autogenerate -m "$(name)"
+
+migrate-local:
+	cd backend && alembic upgrade head

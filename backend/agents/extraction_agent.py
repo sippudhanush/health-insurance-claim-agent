@@ -1,9 +1,15 @@
+import os
+from pathlib import Path
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from models.document import Document
+from models import Document
 from schemas.document import LightExtractionResult
 from services.llm_client import groq_client
+from services.doc_parser import parse_document
+
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/files"))
 
 
 class ExtractionAgent:
@@ -17,25 +23,26 @@ class ExtractionAgent:
         results = []
         for doc in documents:
             try:
-                content_for_llm = self._build_light_prompt(doc)
+                parsed_text = await self._read_file(doc.get("file_id", ""))
+                content_for_llm = self._build_light_prompt(doc, parsed_text)
                 extracted = await groq_client.light_extract(content_for_llm, trace_id=claim_id)
                 result = LightExtractionResult(
                     file_id=doc["file_id"],
                     detected_type=extracted.get(
                         "detected_type", doc.get("actual_type")
                     ),
-                    quality=extracted.get("quality", doc.get("quality", "GOOD")),
+                    quality=extracted.get("quality") or doc.get("quality") or "GOOD",
                     patient_name_on_doc=extracted.get(
                         "patient_name", doc.get("patient_name_on_doc")
                     ),
-                    confidence=extracted.get("confidence", 0.9),
+                    confidence=extracted.get("confidence") or 0.9,
                 )
             except Exception as e:
                 self.degraded = True
                 result = LightExtractionResult(
                     file_id=doc["file_id"],
                     detected_type=doc.get("actual_type"),
-                    quality=doc.get("quality", "GOOD"),
+                    quality=doc.get("quality") or "GOOD",
                     patient_name_on_doc=doc.get("patient_name_on_doc"),
                     confidence=0.5,
                     error=str(e),
@@ -103,10 +110,18 @@ class ExtractionAgent:
         await self.db.flush()
         return result_docs
 
-    def _build_light_prompt(self, doc: dict) -> str:
+    async def _read_file(self, file_id: str) -> str:
+        path = UPLOAD_DIR / file_id
+        if path.exists():
+            return await parse_document(path)
+        return ""
+
+    def _build_light_prompt(self, doc: dict, parsed_text: str = "") -> str:
         parts = [f"File: {doc.get('file_name', doc['file_id'])}"]
         if doc.get("actual_type"):
             parts.append(f"Expected type: {doc['actual_type']}")
+        if parsed_text:
+            parts.append(f"Document text: {parsed_text[:2000]}")
         if doc.get("content"):
             parts.append(f"Content: {doc['content']}")
         if doc.get("quality") == "UNREADABLE":

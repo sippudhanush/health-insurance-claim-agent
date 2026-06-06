@@ -21,6 +21,8 @@ services:
   backend:
     build: ./backend
     env_file: .env
+    environment:
+      UPLOAD_DIR: /files
     depends_on:
       plum_postgres:
         condition: service_healthy
@@ -29,10 +31,13 @@ services:
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
       - ./backend:/app
+      - ./files:/files
 
   frontend:
     build: ./frontend
     env_file: .env
+    environment:
+      UPLOAD_DIR: /files
     depends_on:
       - backend
     ports:
@@ -40,6 +45,7 @@ services:
     command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
     volumes:
       - ./frontend:/app
+      - ./files:/files
 
 volumes:
   pgdata:

@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from models.decision import DecisionRecord
+from models import DecisionRecord
 from schemas.decision import (
     DecisionOutput,
     PolicyResult,
