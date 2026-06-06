@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 from pydantic import BaseModel
-from agents import Agent, Runner, function_tool, ModelSettings
+from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
 
 
 class DecisionOut(BaseModel):
@@ -62,7 +62,7 @@ async def decide_claim(items: str) -> str:
         name="DecisionMaker",
         instructions=INSTRUCTIONS,
         model="gpt-4o-mini",
-        output_type=DecisionOut,
+        output_type=AgentOutputSchema(DecisionOut, strict_json_schema=False),
         model_settings=ModelSettings(reasoning={"effort": "low"}),
     )
 

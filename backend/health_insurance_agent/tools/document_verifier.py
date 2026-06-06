@@ -5,7 +5,7 @@ import logging
 import os
 from typing import List, Optional
 from pydantic import BaseModel
-from agents import Agent, Runner, function_tool, ModelSettings
+from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
 
 logger = logging.getLogger("doc_verifier")
 
@@ -145,7 +145,7 @@ async def verify_documents(items: str) -> str:
         instructions=INSTRUCTIONS,
         model="gpt-4o-mini",
         tools=[classify_document_with_vision],
-        output_type=DocVerificationOut,
+        output_type=AgentOutputSchema(DocVerificationOut, strict_json_schema=False),
         model_settings=ModelSettings(reasoning={"effort": "low"}),
     )
 

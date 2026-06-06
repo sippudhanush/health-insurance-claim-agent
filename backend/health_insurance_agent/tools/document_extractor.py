@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 from pydantic import BaseModel
-from agents import Agent, Runner, function_tool, ModelSettings
+from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
 from openai import AsyncOpenAI
 import os
 import logging
@@ -121,7 +121,7 @@ async def extract_documents(items: str) -> str:
         instructions=INSTRUCTIONS,
         model="gpt-4o-mini",
         tools=[extract_with_vision],
-        output_type=ExtractionOut,
+        output_type=AgentOutputSchema(ExtractionOut, strict_json_schema=False),
         model_settings=ModelSettings(reasoning={"effort": "low"}),
     )
 

@@ -7,9 +7,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 from pydantic import BaseModel
-from agents import Agent, Runner, ModelSettings, RunConfig, trace
+from agents import Agent, Runner, ModelSettings, RunConfig, trace, AgentOutputSchema
 from agents.tracing import add_trace_processor
-from agents.tracing.processors import ConsoleSpanExporter
+from agents.tracing.processors import ConsoleSpanExporter, BatchTraceProcessor
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 
 from health_insurance_agent.tools.document_verifier import verify_documents
@@ -34,7 +34,7 @@ _TRACING_SETUP = False
 def _ensure_tracing() -> None:
     global _TRACING_SETUP
     if not _TRACING_SETUP:
-        add_trace_processor(ConsoleSpanExporter())
+        add_trace_processor(BatchTraceProcessor(ConsoleSpanExporter()))
         _TRACING_SETUP = True
         logger.info("ConsoleSpanExporter registered — traces will print to terminal")
 
@@ -92,7 +92,7 @@ def build_agent() -> Agent:
         name="HealthInsuranceClaimProcessor",
         instructions=instr,
         model=AGENT_MODEL,
-        model_settings=ModelSettings(reasoning={"effort": "low"}),
+        model_settings=ModelSettings(temperature=0.1),
         tools=[
             verify_documents,
             extract_documents,
@@ -100,7 +100,7 @@ def build_agent() -> Agent:
             detect_fraud,
             decide_claim,
         ],
-        output_type=ClaimOut,
+        output_type=AgentOutputSchema(ClaimOut, strict_json_schema=False),
     )
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 from pydantic import BaseModel
-from agents import Agent, Runner, function_tool, ModelSettings
+from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
 
 
 class FraudCheckOut(BaseModel):
@@ -57,7 +57,7 @@ async def detect_fraud(items: str) -> str:
         name="FraudDetector",
         instructions=INSTRUCTIONS,
         model="gpt-4o-mini",
-        output_type=FraudCheckOut,
+        output_type=AgentOutputSchema(FraudCheckOut, strict_json_schema=False),
         model_settings=ModelSettings(reasoning={"effort": "low"}),
     )
 

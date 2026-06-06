@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 from pydantic import BaseModel
-from agents import Agent, Runner, function_tool, ModelSettings
+from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
 
 
 class PolicyCheckItem(BaseModel):
@@ -79,7 +79,7 @@ async def check_policy(items: str) -> str:
         name="PolicyChecker",
         instructions=INSTRUCTIONS,
         model="gpt-4o-mini",
-        output_type=PolicyCheckOut,
+        output_type=AgentOutputSchema(PolicyCheckOut, strict_json_schema=False),
         model_settings=ModelSettings(reasoning={"effort": "low"}),
     )
 
