@@ -17,3 +17,4 @@ greenlet==3.5.1
 aiosqlite==0.22.1
 langfuse==4.7.1
 sse-starlette==2.2.1
+openai==1.68.0

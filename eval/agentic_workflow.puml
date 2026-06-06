@@ -5,7 +5,7 @@ skinparam sequenceMessageAlign center
 skinparam participantPadding 20
 skinparam boxPadding 10
 
-title Plum Claims Processing — Multi-Agent Orchestration (ReAct)
+title Plum Claims Processing — LLM-Driven Orchestrator
 
 actor "Member" as MEMBER
 actor "Ops Team" as OPS
@@ -14,181 +14,106 @@ box "Frontend" #E8F4FD
   participant "Streamlit UI" as UI
 end box
 
-box "Orchestrator Layer" #F0E6FF
-  participant "Orchestrator Agent\n(LLM-powered)" as ORCH
-  entity "Groq API\n(Llama3-70b)\n[Function Calling]" as GROQ_ORCH
+box "Backend API" #F0E6FF
+  participant "FastAPI\n(POST /api/claims)" as API
+  participant "Pipeline\n(Orchestrator Agent)" as PIPE
 end box
 
-box "Tools (Agents)" #E8FFE8
-  participant "extract_documents\n[Tool]" as EXT
-  participant "validate_documents\n[Tool]" as VAL
-  participant "deep_extract_documents\n[Tool]" as DEEP
-  participant "evaluate_policy\n[Tool]" as POL
-  participant "detect_fraud\n[Tool]" as FRAUD
-  participant "decide_claim\n[Tool]" as DEC
+box "Sub-Agents (called as tools)" #E8FFE8
+  participant "DocVerifierAgent" as A1
+  participant "DocExtractorAgent\n(vision)" as A2
+  participant "PolicyCheckerAgent" as A3
+  participant "FraudDetectorAgent" as A4
+  participant "DecisionMakerAgent" as A5
 end box
 
 box "Infrastructure" #FFF3E0
   database "PostgreSQL" as DB
-  entity "Groq API\n(Llama3)" as GROQ_EXT
+  entity "Groq API\n(llama-3.3-70b / llama-4-scout)" as GROQ
 end box
 
-== 1. Claim Submission (SSE Stream) ==
+== 1. Claim Submission ==
 MEMBER -> UI: Upload docs + fill form
-UI -> ORCH: POST /api/claims [Accept: text/event-stream]
-ORCH -> DB: INSERT claim (status=PROCESSING)
-ORCH --> UI: SSE: { claim_id, status: PROCESSING }
-note right #E8F4FD: SSE stream opened — live updates follow
-UI --> MEMBER: "Processing claim..."
+UI -> API: POST /api/claims [SSE stream]
+API -> DB: INSERT claim (status=PROCESSING)
+API --> UI: SSE: { claim_id, status: PROCESSING }
 
-== 2. ReAct Loop: Orchestrator Decides Workflow ==
+== 2. Orchestrator Agent (LLM decides workflow) ==
+API -> PIPE: run_pipeline(claim_data, policy_terms, api_key)
 note right #F0E6FF
-  Orchestrator receives claim info +
-  system prompt with tool definitions.
-  Calls Groq with function calling —
-  LLM decides which tool(s) to call next.
-  Each tool result feeds back as a
-  "tool" message. Loop continues until
-  decide_claim is called or error occurs.
+  Orchestrator has 5 tools.
+  System prompt tells it the
+  workflow rules. LLM decides
+  which tool to call next and
+  in what order.
 end note
 
-ORCH -> GROQ_ORCH: [system] tool definitions + workflow rules\n[user] claim details + "start processing"
-GROQ_ORCH --> ORCH: tool_call: extract_documents({claim_id, documents})
+PIPE -> GROQ: [system prompt + user claim data + tools]
+GROQ --> PIPE: tool_call: verify_documents(...)
 
-== 3. Tool: extract_documents ==
-ORCH --> UI: SSE: { step: "extraction", status: "running" }
-ORCH -> EXT: extract_documents(claim_id, documents)
-EXT -> GROQ_EXT: Classify doc type, assess quality, extract patient name
-GROQ_EXT --> EXT: { doc_type, quality, patient_name, confidence }
-EXT -> DB: INSERT Document records
-EXT --> ORCH: { documents: [...], count: N, degraded: bool }
+|||
+||| Orchestrator loop: LLM decides → execute tool → feed back → LLM decides again |||
+|||
 
-alt LLM fails
-  EXT --> ORCH: degraded=true, fallback metadata
-  note right #FFF3CD: Degraded mode — confidence drops
+PIPE -> A1: verify_documents (called as tool)
+A1 -> A1: Classify docs, validate set
+A1 --> PIPE: { valid, classified_docs, error_message }
+
+alt Verification failed
+  PIPE --> API: SSE: error + done
+  note right #FFB3B3: Early exit — no more tool calls
+  API --> UI: Show specific error
+else Passed
+  PIPE -> GROQ: result fed back → LLM decides next
+  GROQ --> PIPE: tool_call: extract_documents(...)
 end
 
-ORCH --> UI: SSE: { step: "extraction", status: "done", files: N }
-ORCH -> GROQ_ORCH: tool_result: extraction complete\n→ LLM decides next step
-GROQ_ORCH --> ORCH: tool_call: validate_documents({category, documents})
+PIPE -> A2: extract_documents (vision tool)
+A2 -> GROQ: Vision API with base64 images
+GROQ --> A2: { extracted_data, overall_confidence, status }
+A2 --> PIPE: result
 
-== 4. Tool: validate_documents (Early Exit) ==
-ORCH --> UI: SSE: { step: "validation", status: "running" }
-ORCH -> VAL: validate_documents(category, documents)
-VAL -> VAL: Check types match category requirements
-VAL -> VAL: Check quality scores
-VAL -> VAL: Check patient name consistency
-
-alt [Early Exit] Validation Fails
-  VAL --> ORCH: { valid: false, errors: [...] }
-  ORCH --> UI: SSE: { step: "validation", status: "failed", errors }
-  ORCH --> UI: error event with specific actionable message
-  UI --> MEMBER: Show error (e.g. "Expected HOSPITAL_BILL, got PRESCRIPTION")
-  note right #FFB3B3: TC001 / TC002 / TC003 — stops here
-else [Valid]
-  VAL --> ORCH: { valid: true, errors: [] }
-  ORCH --> UI: SSE: { step: "validation", status: "passed" }
-  ORCH -> GROQ_ORCH: tool_result: validation passed
-  GROQ_ORCH --> ORCH: tool_call: deep_extract_documents({claim_id, documents})
-end
-
-== 5. Tool: deep_extract_documents ==
-ORCH --> UI: SSE: { step: "deep_extraction", status: "running" }
-ORCH -> DEEP: deep_extract_documents(claim_id, validated_docs)
-DEEP -> GROQ_EXT: Extract structured data (diagnosis, medicines, line items, etc.)
-GROQ_EXT --> DEEP: structured JSON per document type
-
-alt [Degraded] LLM timeout/parse failure
-  DEEP --> ORCH: degraded=true, partial extraction
-  note right #FFF3CD: TC011 — graceful degradation
-  ORCH --> UI: SSE: { step: "deep_extraction", status: "degraded" }
-else [Success]
-  DEEP --> ORCH: full_extracted_data
-  ORCH --> UI: SSE: { step: "deep_extraction", status: "done" }
-end
-DEEP -> DB: UPDATE Document (extracted_content, confidence)
-
-ORCH -> GROQ_ORCH: tool_result: deep extraction complete
-GROQ_ORCH --> ORCH: tool_call: evaluate_policy({...})  +  tool_call: detect_fraud({...})
+PIPE -> GROQ: result fed back → LLM decides next
+GROQ --> PIPE: tool_call: check_policy(...)
 note right #F0E6FF
-  LLM can call multiple tools
-  in parallel since policy and
-  fraud are independent.
+  LLM may call check_policy
+  and detect_fraud in either
+  order or even parallel
 end note
 
-== 6. Tool: evaluate_policy ==
-ORCH --> UI: SSE: { step: "policy", status: "running" }
-ORCH -> POL: evaluate_policy(member_id, category, amount, extracted_docs)
-POL -> DB: LOAD policy_terms.json, member info
-group Policy Checks
-  POL -> POL: Coverage check
-  POL -> POL: Waiting period check (TC005)
-  POL -> POL: Exclusion check (TC012)
-  POL -> POL: Pre-auth check (TC007)
-  POL -> POL: Per-claim limit check (TC008)
-  POL -> POL: Sub-limit check
-  POL -> POL: Network discount calc (TC010)
-  POL -> POL: Co-pay calc
-end
+PIPE -> A3: check_policy (tool)
+A3 -> GROQ: Policy rules evaluation
+A3 --> PIPE: { all_passed, approved_amount, copay_amount, policy_checks }
 
-alt Any check rejects
-  POL --> ORCH: { eligible: false, rejection_reasons, checks }
-  ORCH --> UI: SSE: { step: "policy", status: "rejected", reasons }
-else All pass (possibly partial)
-  POL --> ORCH: { eligible: true, approved_amount_estimate, checks }
-  ORCH --> UI: SSE: { step: "policy", status: "passed" }
-end
-POL -> DB: INSERT PolicyCheck records
+PIPE -> GROQ: result fed back → LLM decides next
+GROQ --> PIPE: tool_call: detect_fraud(...)
 
-== 7. Tool: detect_fraud ==
-ORCH --> UI: SSE: { step: "fraud", status: "running" }
-ORCH -> FRAUD: detect_fraud(member_id, amount, treatment_date)
-FRAUD -> DB: SELECT claims_history (same-day, same-month, high-value)
-FRAUD -> FRAUD: Compare against fraud thresholds
+PIPE -> A4: detect_fraud (tool)
+A4 -> DB: Query claims history
+A4 -> GROQ: Fraud analysis
+A4 --> PIPE: { fraud_score, fraud_flags, recommendation }
 
-alt Fraud score >= 0.8
-  FRAUD --> ORCH: { fraud_score: 0.85, signals, flagged: true }
-  note right #FFE0E0: TC009 — routed to manual review
-  ORCH --> UI: SSE: { step: "fraud", status: "flagged", score: 0.85 }
-else No signals
-  FRAUD --> ORCH: { fraud_score: 0.0, signals: [], flagged: false }
-  ORCH --> UI: SSE: { step: "fraud", status: "passed", score: 0.0 }
-end
-FRAUD -> DB: INSERT FraudCheck record
+PIPE -> GROQ: result fed back → LLM decides next
+GROQ --> PIPE: tool_call: decide_claim(...)
 
-ORCH -> GROQ_ORCH: tool_results: policy + fraud complete
-GROQ_ORCH --> ORCH: tool_call: decide_claim({all accumulated results})
+PIPE -> A5: decide_claim (tool - final)
+A5 -> GROQ: Synthesise all results → final decision
+GROQ --> A5: { decision, approved_amount, reason, confidence, trace }
+A5 --> PIPE: Final decision with full trace
 
-== 8. Tool: decide_claim ==
-ORCH --> UI: SSE: { step: "decision", status: "running" }
-ORCH -> DEC: decide_claim(claim_id, validation, extraction, deep_extraction, policy, fraud)
-
-note right #D4E6F1
-  Decision Matrix:
-  Validation failed? -> REJECTED
-  Fraud >= 0.8?     -> MANUAL_REVIEW
-  Policy rejected?  -> REJECTED
-  Partial amount?   -> PARTIAL
-  All clear?        -> APPROVED
-  Degraded mode -> confidence penalty
-end note
-
-DEC --> ORCH: { decision, approved_amount, confidence, trace, breakdown }
-DEC -> DB: INSERT DecisionRecord + full trace
-
-ORCH -> DB: UPDATE Claim (status, decision, trace)
-ORCH --> UI: SSE: { decision, approved_amount, trace, breakdown }
-ORCH --> UI: SSE: [DONE]
-UI --> MEMBER: Show result + expandable trace + live log
+== 3. Result ==
+PIPE -> DB: UPDATE Claim + INSERT DecisionRecord
+PIPE --> API: SSE: { result } → { done }
+API --> UI: Show decision, amount, reason, trace
 
 alt MANUAL_REVIEW
-  UI --> OPS: Notify team for review
+  UI --> OPS: Notify team
   OPS -> UI: Review trace, approve/override
 end
 
-== 9. Explainability (Always Available) ==
-OPS -> ORCH: GET /api/claims/{id}/trace
-ORCH -> DB: SELECT trace
-ORCH --> OPS: Full step-by-step breakdown with all tool results
+== 4. Trace / Explainability ==
+OPS -> API: GET /api/claims/{id}
+API -> DB: SELECT claim + trace
+API --> OPS: Full decision + agent outputs
 
 @enduml
