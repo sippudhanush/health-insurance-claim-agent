@@ -1,0 +1,140 @@
+@startuml
+!theme plain
+skinparam backgroundColor #FEFEFE
+skinparam sequenceMessageAlign center
+skinparam participantPadding 20
+skinparam boxPadding 10
+
+title Plum Claims Processing — Pipeline-of-Agents
+
+actor "Member" as MEMBER
+actor "Ops Team" as OPS
+
+box "Frontend" #E8F4FD
+  participant "Streamlit UI" as UI
+end box
+
+box "Backend API" #F0E6FF
+  participant "Orchestrator\n(FastAPI)" as ORCH
+end box
+
+box "Pipeline Agents" #E8FFE8
+  participant "Extraction Agent\n(Light Pass)" as EA_LIGHT
+  participant "Validation Agent\n(Intake)" as VA
+  participant "Extraction Agent\n(Deep Pass)" as EA_DEEP
+  participant "Policy Agent" as PA
+  participant "Fraud Agent" as FA
+  participant "Decision Agent" as DA
+end box
+
+box "Infrastructure" #FFF3E0
+  database "PostgreSQL" as DB
+  entity "Groq API\n(Llama3)" as GROQ
+end box
+
+== 1. Claim Submission ==
+MEMBER -> UI: Upload docs + fill form
+UI -> ORCH: POST /api/claims
+ORCH -> DB: INSERT claim (status=RECEIVED)
+ORCH --> UI: { claim_id, status: RECEIVED }
+
+== 2. Light Extraction + Validation (Early Exit) ==
+ORCH -> EA_LIGHT: light_extract(files[])
+EA_LIGHT -> GROQ: Classify doc type, assess quality, extract patient name
+GROQ --> EA_LIGHT: { doc_type, quality, patient_name, confidence }
+EA_LIGHT --> ORCH: per-file metadata
+
+ORCH -> VA: validate_documents(category, extracted_meta[])
+VA -> VA: Check types match category requirements
+VA -> VA: Check quality scores
+VA -> VA: Check patient name consistency
+
+alt [Early Exit] Validation Fails
+  VA --> ORCH: ValidationError(wrong_type | unreadable | patient_mismatch)
+  ORCH --> UI: 422 + specific, actionable message
+  UI --> MEMBER: Show error (e.g. "Expected HOSPITAL_BILL, got PRESCRIPTION")
+  note right #FFB3B3: TC001 / TC002 / TC003 — stops here
+else [Valid]
+  VA --> ORCH: validation_passed
+end
+
+== 3. Deep Extraction ==
+ORCH -> EA_DEEP: deep_extract(claim_id, validated_docs)
+EA_DEEP -> GROQ: Extract all fields (diagnosis, line items, amounts, doctor, dates)
+GROQ --> EA_DEEP: structured JSON per document
+
+alt [Degraded] LLM timeout/parse failure
+  EA_DEEP --> ORCH: partial_data + low_confidence
+  note right #FFF3CD: TC011 — graceful degradation
+else [Success]
+  EA_DEEP --> ORCH: full_extracted_data
+end
+EA_DEEP -> DB: INSERT extracted_docs
+
+== 4. Policy Rules ==
+ORCH -> PA: evaluate_policy(member_id, category, extracted_data)
+PA -> DB: LOAD policy_terms.json, member info
+group Policy Checks (parallel)
+  PA -> PA: Coverage check
+  PA -> PA: Waiting period check (TC005)
+  PA -> PA: Exclusion check (TC012)
+  PA -> PA: Pre-auth check (TC007)
+  PA -> PA: Per-claim limit check (TC008)
+  PA -> PA: Sub-limit check
+  PA -> PA: Network discount calc (TC010)
+  PA -> PA: Co-pay calc
+end
+
+alt Any check rejects
+  PA --> ORCH: policy_rejection(reasons[], eligibility_dates)
+else All pass (possibly partial)
+  PA --> ORCH: policy_ok(approved_estimate, copay, discount)
+end
+PA -> DB: INSERT policy_results
+
+== 5. Fraud Detection ==
+ORCH -> FA: detect_fraud(member_id, claim_amount)
+FA -> DB: SELECT claims_history (same-day, same-month, high-value)
+FA -> FA: Compare against fraud_thresholds
+
+alt Fraud score > threshold
+  FA --> ORCH: fraud_signals[same_day_exceeded], score=0.85
+  note right #FFE0E0: TC009 — routed to manual review
+else No signals
+  FA --> ORCH: fraud_score=0.02
+end
+FA -> DB: INSERT fraud_results
+
+== 6. Decision Engine ==
+ORCH -> DA: decide(validation, extraction, policy, fraud)
+
+DA -> DA: Aggregate all agent outputs
+
+note right #D4E6F1
+  Decision Matrix:
+  Policy reject? -> REJECTED
+  Fraud > 0.8?  -> MANUAL_REVIEW
+  Partial amt?  -> PARTIAL
+  All clear?    -> APPROVED
+end note
+
+alt Degraded mode (TC011)
+  DA -> DA: Reduce confidence, append degradation note
+end
+
+DA --> ORCH: final_decision {\n  decision, approved_amount,\n  reasons[], trace[],\n  confidence_score\n}
+ORCH -> DB: INSERT decision + full trace
+ORCH --> UI: { decision, trace, breakdown }
+UI --> MEMBER: Show result + expandable trace
+
+alt MANUAL_REVIEW
+  UI --> OPS: Notify team
+  OPS -> UI: Review trace, approve/override
+end
+
+== 7. Explainability (Always Available) ==
+OPS -> ORCH: GET /api/claims/{id}/trace
+ORCH -> DB: SELECT trace
+ORCH --> OPS: Full step-by-step breakdown
+
+@enduml

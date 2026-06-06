@@ -1,0 +1,17 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+python-dotenv==1.0.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+httpx==0.28.1
+python-multipart==0.0.18
+Pillow==11.1.0
+PyMuPDF==1.25.2
+fpdf2==2.8.2
+pytest==8.3.4
+pytest-asyncio==0.24.0
+greenlet==3.5.1
+aiosqlite==0.22.1
