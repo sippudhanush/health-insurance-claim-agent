@@ -1,6 +1,7 @@
 import streamlit as st
 import httpx
 import json
+import uuid
 from datetime import date
 import os
 
@@ -75,50 +76,23 @@ with tab1:
 
         category_req = doc_req.get(claim_category, {})
         documents = []
+        uploaded_files = {}
 
         if category_req:
             for doc_type in category_req.get("required", []):
                 st.markdown(f"##### {doc_type} *(Required)*")
-                c1, c2 = st.columns(2)
-                with c1:
-                    fid = st.text_input("File ID", value=f"{doc_type[:4]}_001", key=f"req_{doc_type}_fid")
-                    st.markdown(f"**Type:** {doc_type}")
-                with c2:
-                    pname = st.text_input("Patient Name", key=f"req_{doc_type}_pname")
-
-                use_json = st.checkbox("Add structured content", key=f"req_{doc_type}_json")
-                content_str = ""
-                if use_json:
-                    content_str = st.text_area("Content (JSON)", key=f"req_{doc_type}_content", height=80)
-
-                doc = {"file_id": fid, "actual_type": doc_type}
-                if pname:
-                    doc["patient_name_on_doc"] = pname
-                if content_str:
-                    doc["content"] = json.loads(content_str)
-                documents.append(doc)
+                uploaded = st.file_uploader(f"Upload {doc_type}", key=f"req_{doc_type}_upload")
+                uploaded_files[doc_type] = uploaded
+                if uploaded:
+                    st.caption(f"Uploaded: {uploaded.name} ({uploaded.size:,} bytes)")
                 st.divider()
 
             for doc_type in category_req.get("optional", []):
                 st.markdown(f"##### {doc_type} *(Optional)*")
-                c1, c2 = st.columns(2)
-                with c1:
-                    fid = st.text_input("File ID", value=f"{doc_type[:4]}_001", key=f"opt_{doc_type}_fid")
-                    st.markdown(f"**Type:** {doc_type}")
-                with c2:
-                    pname = st.text_input("Patient Name", key=f"opt_{doc_type}_pname")
-
-                use_json = st.checkbox("Add structured content", key=f"opt_{doc_type}_json")
-                content_str = ""
-                if use_json:
-                    content_str = st.text_area("Content (JSON)", key=f"opt_{doc_type}_content", height=80)
-
-                doc = {"file_id": fid, "actual_type": doc_type}
-                if pname:
-                    doc["patient_name_on_doc"] = pname
-                if content_str:
-                    doc["content"] = json.loads(content_str)
-                documents.append(doc)
+                uploaded = st.file_uploader(f"Upload {doc_type}", key=f"opt_{doc_type}_upload")
+                uploaded_files[doc_type] = uploaded
+                if uploaded:
+                    st.caption(f"Uploaded: {uploaded.name} ({uploaded.size:,} bytes)")
                 st.divider()
         else:
             st.info("No document requirements defined for this category.")
@@ -126,6 +100,16 @@ with tab1:
         submitted = st.form_submit_button("Submit Claim")
 
     if submitted:
+        documents = []
+        for doc_type, uploaded in uploaded_files.items():
+            doc = {
+                "file_id": str(uuid.uuid4()),
+                "actual_type": doc_type,
+            }
+            if uploaded:
+                doc["file_name"] = uploaded.name
+            documents.append(doc)
+
         payload = {
             "member_id": member_id,
             "policy_id": policy_id,
