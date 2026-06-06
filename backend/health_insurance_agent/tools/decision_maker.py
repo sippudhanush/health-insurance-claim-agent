@@ -70,7 +70,7 @@ async def decide_claim(items: str) -> str:
     result = await Runner.run(
         agent,
         input=json.dumps(raw, ensure_ascii=False),
-        max_turns=10,
+        max_turns=5,
     )
 
     if isinstance(result.final_output, DecisionOut):

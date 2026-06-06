@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from typing import List, Optional
 from pydantic import BaseModel
@@ -68,7 +69,8 @@ Input:
 - documents: list of {transaction_uuid, doc_type, base64_content}
 - You have one tool: extract_with_vision(base64_content, doc_type)
 
-For each document, call extract_with_vision which sends the image to OpenAI vision.
+For each document, call extract_with_vision ONCE which sends the image to OpenAI vision.
+If it returns an error, mark the doc with low confidence and move on. Do NOT retry.
 Merge results into the output schema based on doc_type:
 - PRESCRIPTION → doctor_name, reg_no, patient_name, age, gender, date, diagnosis, medicines[], tests_ordered[]
 - HOSPITAL_BILL → hospital_name, bill_no, date, patient_name, line_items[], total_amount
@@ -80,28 +82,50 @@ Never fail whole doc because one field is unclear.
 """
 
 
+def _ensure_image_base64(content: str) -> str:
+    """Convert PDF to PNG image if content is a PDF, otherwise return as-is."""
+    try:
+        import fitz
+        raw = base64.b64decode(content)
+        doc = fitz.open(stream=raw, filetype="pdf")
+        page = doc[0]
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+        doc.close()
+        return base64.b64encode(img_bytes).decode()
+    except Exception:
+        return content
+
+
 @function_tool
 async def extract_with_vision(base64_content: str, doc_type: str) -> str:
-    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    resp = await client.chat.completions.create(
-        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": EXTRACT_VISION_PROMPT},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_content}"}},
-                ],
-            }
-        ],
-        temperature=0.1,
-    )
-    raw = resp.choices[0].message.content or "{}"
-    raw = raw.strip()
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        raw = "\n".join(lines[1:-1])
-    return raw
+    image_content = _ensure_image_base64(base64_content)
+    try:
+        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        resp = await client.chat.completions.create(
+            model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": EXTRACT_VISION_PROMPT},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_content}"}},
+                    ],
+                }
+            ],
+            temperature=0.1,
+        )
+        raw = resp.choices[0].message.content or "{}"
+        raw = raw.strip()
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            raw = "\n".join(lines[1:-1])
+        return raw
+    except Exception as e:
+        return json.dumps({
+            "error": str(e),
+            "confidence": 0.0,
+        })
 
 
 @function_tool
@@ -128,7 +152,7 @@ async def extract_documents(items: str) -> str:
     result = await Runner.run(
         agent,
         input=json.dumps(raw, ensure_ascii=False),
-        max_turns=20,
+        max_turns=3,
     )
 
     if isinstance(result.final_output, ExtractionOut):

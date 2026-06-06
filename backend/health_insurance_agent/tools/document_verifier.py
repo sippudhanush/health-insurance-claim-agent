@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -54,6 +55,21 @@ class DocVerificationOut(BaseModel):
     wrong_docs: List[str] = []
 
 
+def _ensure_image_base64(content: str) -> str:
+    """Convert PDF to PNG image if content is a PDF, otherwise return as-is."""
+    try:
+        import fitz
+        raw = base64.b64decode(content)
+        doc = fitz.open(stream=raw, filetype="pdf")
+        page = doc[0]
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+        doc.close()
+        return base64.b64encode(img_bytes).decode()
+    except Exception:
+        return content
+
+
 @function_tool
 async def classify_document_with_vision(base64_content: str) -> str:
     """Analyze a medical document image and classify its type using vision AI."""
@@ -62,27 +78,38 @@ async def classify_document_with_vision(base64_content: str) -> str:
 
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    resp = await client.chat.completions.create(
-        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": CLASSIFY_VISION_PROMPT},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_content}"}},
-                ],
-            }
-        ],
-        temperature=0.1,
-        max_tokens=500,
-    )
-    raw = resp.choices[0].message.content or "{}"
-    raw = raw.strip()
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        raw = "\n".join(lines[1:-1])
-    return raw
+    image_content = _ensure_image_base64(base64_content)
+
+    try:
+        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        resp = await client.chat.completions.create(
+            model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": CLASSIFY_VISION_PROMPT},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_content}"}},
+                    ],
+                }
+            ],
+            temperature=0.1,
+            max_tokens=500,
+        )
+        raw = resp.choices[0].message.content or "{}"
+        raw = raw.strip()
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            raw = "\n".join(lines[1:-1])
+        return raw
+    except Exception as e:
+        return json.dumps({
+            "detected_type": "UNKNOWN",
+            "patient_name": None,
+            "quality": "UNREADABLE",
+            "confidence": 0.0,
+            "reasoning": f"Vision API error: {e}",
+        })
 
 
 INSTRUCTIONS = """
@@ -98,6 +125,8 @@ Input includes:
 Steps:
 1) For each document that has base64_content, call classify_document_with_vision(base64_content)
    to get the actual document type independently. Set vision_classification to the result.
+   Call it EXACTLY ONCE per document — if it returns low confidence or an error, use what you have
+   and move on. Do NOT retry. Set valid=false and include the error in the output.
 2) For documents WITHOUT base64_content, use doc_type_hint as detected_type and
    do NOT set vision_classification or type_mismatch.
 3) Compare vision_classification with doc_type_hint. If they differ, set type_mismatch=true,
@@ -157,7 +186,7 @@ async def _run_verification(items: str) -> str:
     result = await Runner.run(
         agent,
         input=json.dumps(raw, ensure_ascii=False),
-        max_turns=20,
+        max_turns=3,
     )
 
     if isinstance(result.final_output, DocVerificationOut):
