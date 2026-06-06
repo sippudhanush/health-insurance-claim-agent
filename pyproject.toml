@@ -1,0 +1,12 @@
+[project]
+name = "health-insurance-claim-agent"
+version = "0.1.0"
+description = "Health insurance claim processing agent using OpenAI Agents SDK"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.68.0",
+    "openai-agents>=0.17.0",
+    "pydantic>=2.10.0",
+]
+
+

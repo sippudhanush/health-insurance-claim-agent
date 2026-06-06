@@ -1,0 +1,23 @@
+@startuml
+!theme plain
+
+title Health Insurance Claim Agent
+
+rectangle "<b>Orchestrator</b>\nHealthInsuranceClaimProcessor" as ORCH
+rectangle "<b>Sub-Agents</b>\n(each is its own Agent)" as SUB
+
+rectangle "verify_documents" as V
+rectangle "extract_documents" as E
+rectangle "check_policy" as P
+rectangle "detect_fraud" as F
+rectangle "decide_claim" as D
+
+ORCH --> V : 1
+ORCH --> E : 2
+ORCH --> P : 3
+ORCH --> F : 4
+ORCH --> D : 5
+
+note right of ORCH : Uses trace() + RunConfig\nfor OpenAI tracing
+
+@enduml

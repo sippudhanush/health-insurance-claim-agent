@@ -37,9 +37,3 @@ class RejectionReason(str, Enum):
     INITIAL_WAITING_PERIOD = "INITIAL_WAITING_PERIOD"
     DOCUMENT_ERROR = "DOCUMENT_ERROR"
     FRAUD_FLAG = "FRAUD_FLAG"
-
-
-class ValidationStatus(str, Enum):
-    PASSED = "PASSED"
-    FAILED = "FAILED"
-    DEGRADED = "DEGRADED"
