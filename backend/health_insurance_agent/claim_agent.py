@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 from pydantic import BaseModel
 from agents import Agent, Runner, ModelSettings, RunConfig, trace
+from agents.tracing import add_trace_processor
+from agents.tracing.processors import ConsoleSpanExporter
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 
 from health_insurance_agent.tools.document_verifier import verify_documents
@@ -25,6 +27,16 @@ logger.setLevel(os.getenv("CLAIM_AGENT_LOG_LEVEL", "INFO"))
 
 AGENT_MODEL = os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini")
 POLICY_PATH = Path(__file__).resolve().parent.parent / "data" / "policy_terms.json"
+
+_TRACING_SETUP = False
+
+
+def _ensure_tracing() -> None:
+    global _TRACING_SETUP
+    if not _TRACING_SETUP:
+        add_trace_processor(ConsoleSpanExporter())
+        _TRACING_SETUP = True
+        logger.info("ConsoleSpanExporter registered — traces will print to terminal")
 
 
 def load_policy_terms() -> dict:
@@ -123,6 +135,8 @@ async def process_claim(claim_data: Dict[str, Any]) -> Dict[str, Any]:
     if claim_data.get("simulate_component_failure"):
         payload["simulate_component_failure"] = True
 
+    _ensure_tracing()
+
     with trace("Health Insurance Claim Processing", group_id=claim_id):
         logger.info("Processing claim: %s", claim_id)
         agent = build_agent()
@@ -135,17 +149,17 @@ async def process_claim(claim_data: Dict[str, Any]) -> Dict[str, Any]:
             )
             result = getattr(res, "final_output", res)
         except Exception as e:
-            logger.error("Agent pipeline failed for %s: %s", claim_id, e)
-            result = {
-                "claim_id": claim_id,
-                "decision": "MANUAL_REVIEW",
-                "approved_amount": None,
-                "confidence_score": 0.3,
-                "rejection_reasons": ["SYSTEM_ERROR"],
-                "reasoning": f"Pipeline error: {e}",
-                "line_item_breakdown": None,
-                "degradation_notes": [f"Pipeline failed: {e}"],
-            }
+                logger.error("Agent pipeline failed for %s: %s", claim_id, e)
+                result = {
+                    "claim_id": claim_id,
+                    "decision": "MANUAL_REVIEW",
+                    "approved_amount": None,
+                    "confidence_score": 0.3,
+                    "rejection_reasons": ["SYSTEM_ERROR"],
+                    "reasoning": f"Pipeline error: {e}",
+                    "line_item_breakdown": None,
+                    "degradation_notes": [f"Pipeline failed: {e}"],
+                }
 
     if isinstance(result, ClaimOut):
         output = result.model_dump()
