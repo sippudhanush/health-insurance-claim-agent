@@ -1,17 +1,63 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.tool import Tool
+from services.llm_client import groq_client
 from models import DecisionRecord
+import json
 
 
-EXCLUDED_TERMS = [
-    "teeth whitening", "veneers", "orthodontic", "braces", "implants",
-    "bleaching", "lasik", "refractive surgery", "cosmetic", "bariatric",
-    "obesity", "weight loss",
-]
+DECISION_SYSTEM_PROMPT = """You are a claim decision agent for health insurance. Your job is to produce the final decision for a claim based on all previous stage results.
+
+You will receive:
+1. Claim details (claim_id, claimed_amount)
+2. Validation results (valid flag, errors if any)
+3. Extraction results (documents, degraded flag)
+4. Policy evaluation results (eligible, approved_amount_estimate, checks, rejection_reasons)
+5. Fraud detection results (fraud_score, signals, flagged)
+
+Make a decision using these rules in priority order:
+
+1. If validation failed (errors exist): decision = REJECTED, approved_amount = 0
+2. If fraud_score >= 0.8: decision = MANUAL_REVIEW, approved_amount = 0
+3. If policy ineligible: decision = REJECTED, approved_amount = 0
+4. If eligible:
+   - If extraction was degraded: decision = APPROVED (overrides partial), approved_amount = approved_amount_estimate
+   - Else if approved_amount_estimate < claimed_amount: decision = PARTIAL
+   - Else: decision = APPROVED
+
+Confidence score:
+- Start at 0.95
+- Subtract 0.15 if extraction was degraded
+- Subtract 0.05 if fraud_score > 0
+- Minimum 0.30
+
+Line item breakdown (if available):
+- Go through extracted documents' line_items or medicines
+- Check if any item description matches excluded terms (teeth whitening, veneers, orthodontic, braces, implants, bleaching, lasik, refractive surgery, cosmetic, bariatric, obesity, weight loss)
+- Mark excluded items as approved=false with reason "Excluded under policy"
+
+Return a JSON object with:
+{
+  "claim_id": "<id>",
+  "decision": "APPROVED" or "PARTIAL" or "REJECTED" or "MANUAL_REVIEW",
+  "approved_amount": <number>,
+  "confidence_score": <number>,
+  "rejection_reasons": ["REASON1", ...],
+  "line_item_breakdown": [{"description": "...", "amount": <number>, "approved": true/false, "reason": "..."}],
+  "trace": {
+    "claim_id": "<id>",
+    "stages": {
+      "extraction": {"status": "PASSED" or "DEGRADED", "document_count": <number>, "documents": [...]},
+      "validation": {"status": "PASSED" or "FAILED", "errors": [...]},
+      "policy": {"status": "PASSED" or "REJECTED", "checks": [...], "rejection_reasons": [...]},
+      "fraud": {"status": "CLEAR" or "FLAGGED", "fraud_score": <number>, "signals": [...]}
+    }
+  },
+  "degradation_notes": ["Note 1", ...]
+}"""
 
 
 class DecideClaimTool(Tool):
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession | None = None):
         self.db = db
 
     @property
@@ -20,7 +66,7 @@ class DecideClaimTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Make a final claim decision (APPROVED/PARTIAL/REJECTED/MANUAL_REVIEW) based on all previous stage results. Must be called last."
+        return "Make a final claim decision based on all previous stage results using an LLM."
 
     @property
     def parameters(self) -> dict:
@@ -29,46 +75,11 @@ class DecideClaimTool(Tool):
             "properties": {
                 "claim_id": {"type": "string"},
                 "claimed_amount": {"type": "number"},
-                "validation": {
-                    "type": "object",
-                    "properties": {
-                        "valid": {"type": "boolean"},
-                        "errors": {"type": "array", "items": {"type": "object"}},
-                    },
-                },
-                "extraction": {
-                    "type": "object",
-                    "properties": {
-                        "documents": {"type": "array", "items": {"type": "object"}},
-                        "degraded": {"type": "boolean"},
-                        "count": {"type": "integer"},
-                    },
-                },
-                "deep_extraction": {
-                    "type": "object",
-                    "properties": {
-                        "documents": {"type": "array", "items": {"type": "object"}},
-                        "degraded": {"type": "boolean"},
-                    },
-                },
-                "policy": {
-                    "type": "object",
-                    "properties": {
-                        "eligible": {"type": "boolean"},
-                        "approved_amount_estimate": {"type": "number"},
-                        "checks": {"type": "array", "items": {"type": "object"}},
-                        "rejection_reasons": {"type": "array", "items": {"type": "string"}},
-                        "copay_percent": {"type": "number"},
-                    },
-                },
-                "fraud": {
-                    "type": "object",
-                    "properties": {
-                        "fraud_score": {"type": "number"},
-                        "signals": {"type": "array", "items": {"type": "string"}},
-                        "flagged": {"type": "boolean"},
-                    },
-                },
+                "validation": {"type": "object"},
+                "extraction": {"type": "object"},
+                "deep_extraction": {"type": "object"},
+                "policy": {"type": "object"},
+                "fraud": {"type": "object"},
             },
             "required": ["claim_id", "claimed_amount", "validation", "extraction", "policy", "fraud"],
         }
@@ -83,130 +94,30 @@ class DecideClaimTool(Tool):
         policy: dict | None = None,
         fraud: dict | None = None,
     ) -> dict:
-        deep_docs = (deep_extraction or extraction).get("documents", [])
-        is_degraded = extraction.get("degraded", False) or (deep_extraction or {}).get("degraded", False)
-        valid = validation.get("valid", False)
-        fraud_score = (fraud or {}).get("fraud_score", 0.0)
-        policy_eligible = (policy or {}).get("eligible", True)
-        approved_amt = (policy or {}).get("approved_amount_estimate", 0.0) or 0.0
-        rejection_reasons = list((policy or {}).get("rejection_reasons", []))
-        checks = (policy or {}).get("checks", [])
-        signals = (fraud or {}).get("signals", [])
-
-        trace = {
+        user_content = json.dumps({
             "claim_id": claim_id,
-            "stages": {
-                "extraction": {
-                    "status": "DEGRADED" if is_degraded else "PASSED",
-                    "document_count": extraction.get("count", len(deep_docs)),
-                    "documents": [
-                        {"file_id": d["file_id"], "type": d.get("detected_type"), "confidence": d.get("confidence")}
-                        for d in deep_docs
-                    ],
-                },
-                "validation": {
-                    "status": "PASSED" if valid else "FAILED",
-                    "errors": validation.get("errors", []),
-                },
-                "policy": {
-                    "status": "PASSED" if policy_eligible else "REJECTED",
-                    "checks": checks,
-                    "rejection_reasons": rejection_reasons,
-                },
-                "fraud": {
-                    "status": "FLAGGED" if fraud_score >= 0.8 else "CLEAR",
-                    "fraud_score": fraud_score,
-                    "signals": signals,
-                },
-            },
-        }
+            "claimed_amount": claimed_amount,
+            "validation": validation,
+            "extraction": extraction,
+            "deep_extraction": deep_extraction or extraction,
+            "policy": policy or {},
+            "fraud": fraud or {},
+        }, indent=2, default=str)
 
-        degradation_notes = []
-        if is_degraded:
-            degradation_notes.append("Document extraction ran with degraded quality. Some fields may be missing.")
-            degradation_notes.append("Manual review recommended due to incomplete processing.")
+        result = await groq_client.structured_extract(DECISION_SYSTEM_PROMPT, user_content, max_tokens=4000)
 
-        if not valid:
-            decision = "REJECTED"
-            approved_amount = 0.0
-            confidence = 0.95
-            rejection_reasons = [e.get("code", "DOCUMENT_ERROR") for e in validation.get("errors", [])]
-        elif fraud_score >= 0.8:
-            decision = "MANUAL_REVIEW"
-            approved_amount = 0.0
-            confidence = fraud_score
-            trace["stages"]["fraud"]["routed_to"] = "MANUAL_REVIEW"
-            rejection_reasons = ["FRAUD_FLAG"]
-        elif not policy_eligible:
-            decision = "REJECTED"
-            approved_amount = 0.0
-            confidence = 0.95
-        else:
-            line_item_breakdown = self._build_line_item_breakdown(deep_docs, approved_amt, claimed_amount)
+        if self.db:
+            dec_record = DecisionRecord(
+                claim_id=claim_id,
+                decision=result.get("decision"),
+                approved_amount=result.get("approved_amount"),
+                confidence_score=result.get("confidence_score"),
+                rejection_reasons=result.get("rejection_reasons", []),
+                line_item_breakdown=result.get("line_item_breakdown"),
+                trace=result.get("trace", {}),
+                degradation_notes=result.get("degradation_notes"),
+            )
+            self.db.add(dec_record)
+            await self.db.flush()
 
-            base_confidence = 0.95
-            penalty = 0.0
-            if is_degraded:
-                penalty += 0.15
-            if fraud_score > 0:
-                penalty += 0.05
-            confidence = round(max(base_confidence - penalty, 0.3), 2)
-
-            approved_amount = approved_amt
-            decision = "APPROVED"
-            if approved_amount < claimed_amount:
-                decision = "PARTIAL"
-            if is_degraded:
-                decision = "APPROVED"
-
-        dec_record = DecisionRecord(
-            claim_id=claim_id,
-            decision=decision,
-            approved_amount=approved_amount,
-            confidence_score=confidence,
-            rejection_reasons=rejection_reasons,
-            line_item_breakdown=line_item_breakdown if decision in ("APPROVED", "PARTIAL") else None,
-            trace=trace,
-            degradation_notes=degradation_notes or None,
-        )
-        self.db.add(dec_record)
-        await self.db.flush()
-
-        return {
-            "claim_id": claim_id,
-            "decision": decision,
-            "approved_amount": approved_amount,
-            "confidence_score": confidence,
-            "rejection_reasons": rejection_reasons,
-            "line_item_breakdown": line_item_breakdown if decision in ("APPROVED", "PARTIAL") else None,
-            "trace": trace,
-            "degradation_notes": degradation_notes,
-        }
-
-    def _build_line_item_breakdown(self, docs: list[dict], approved_amt: float, claimed_amount: float) -> list[dict] | None:
-        line_items = []
-        for doc in docs:
-            content = doc.get("extracted_content") or doc.get("content") or {}
-            if isinstance(content, dict):
-                items = content.get("line_items", []) or content.get("medicines", [])
-                for item in items:
-                    if isinstance(item, dict):
-                        desc = item.get("description", item.get("name", str(item)))
-                        amt = float(item.get("amount", 0))
-                        line_items.append({"description": desc, "amount": amt})
-
-        if not line_items:
-            return None
-
-        breakdown = []
-        for li in line_items:
-            desc = li["description"]
-            amt = li["amount"]
-            is_excluded = any(e.lower() in desc.lower() for e in EXCLUDED_TERMS)
-            breakdown.append({
-                "description": desc,
-                "amount": amt,
-                "approved": not is_excluded,
-                "reason": "Excluded under policy" if is_excluded else None,
-            })
-        return breakdown
+        return result

@@ -86,13 +86,21 @@ class GroqClient:
     async def chat(self, messages: list[dict], tools: list[dict] | None = None, max_tokens: int = 2000) -> dict:
         return await self._call(messages, tools=tools, max_tokens=max_tokens)
 
-    async def _call_prompt(self, prompt: str, content: str) -> str:
+    async def _call_prompt(self, prompt: str, content: str, max_tokens: int = 2000) -> str:
         messages = [
             {"role": "system", "content": prompt},
             {"role": "user", "content": content},
         ]
-        choice = await self._call(messages)
+        choice = await self._call(messages, max_tokens=max_tokens)
         return choice.get("content", "")
+
+    async def structured_extract(self, system_prompt: str, user_content: str, max_tokens: int = 4000) -> dict:
+        raw = await self._call_prompt(system_prompt, user_content, max_tokens=max_tokens)
+        raw_stripped = raw.strip()
+        if raw_stripped.startswith("```"):
+            lines = raw_stripped.split("\n")
+            raw_stripped = "\n".join(lines[1:-1])
+        return json.loads(raw_stripped)
 
     async def light_extract(self, file_description: str, trace_id: str | None = None) -> dict:
         span = langfuse.span(

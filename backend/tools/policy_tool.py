@@ -1,27 +1,69 @@
-import json
-from datetime import date, datetime
-from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.tool import Tool
+from services.llm_client import groq_client
 from models import PolicyCheck
+import json
 
-POLICY_PATH = Path(__file__).parent.parent / "data" / "policy_terms.json"
+
+POLICY_SYSTEM_PROMPT = """You are a policy evaluation agent for health insurance claims. Your job is to evaluate a claim against the full policy terms and make coverage decisions.
+
+You will receive:
+1. Full policy_terms.json content
+2. Claim details (member_id, category, claimed_amount, treatment_date, hospital_name, ytd_claims)
+3. Extracted document content (diagnosis, medicines, line items, tests, etc.)
+4. Member details from the policy
+
+You must evaluate ALL of these checks:
+
+1. **COVERAGE**: Is the claim category covered by the policy? Check opd_categories.{category}.covered.
+
+2. **WAITING PERIODS**: Check the member's join_date against treatment_date. 
+   - Must pass initial_waiting_period_days
+   - Check specific_conditions based on diagnosis (diabetes, hypertension, etc.)
+
+3. **EXCLUSIONS**: Check diagnosis and treatment text against the exclusion conditions list and category-specific exclusions.
+
+4. **PRE-AUTHORIZATION**: Check if the treatment/procedure requires pre-auth. Look at pre_authorization.required_for and any category-specific thresholds.
+
+5. **PER-CLAIM LIMIT**: Check if claimed_amount exceeds coverage.per_claim_limit.
+
+6. **SUB-LIMIT**: Check if claimed_amount exceeds the category's sub_limit.
+
+7. **APPROVED AMOUNT**: If eligible, calculate the approved amount:
+   - If hospital is in network_hospitals, apply network_discount_percent
+   - Apply copay_percent to get the final approved amount
+
+Return a JSON object with:
+{
+  "eligible": true/false,
+  "approved_amount_estimate": <number>,
+  "copay_percent": <number>,
+  "network_discount_percent": <number>,
+  "rejection_reasons": ["REASON1", "REASON2"],
+  "checks": [
+    {
+      "check_name": "coverage" or "waiting_period" or "exclusions" or "pre_auth" or "per_claim_limit" or "sub_limit",
+      "status": "PASSED" or "FAILED" or "WARNING",
+      "details": { ... explanation }
+    }
+  ],
+  "breakdown_details": {
+    "original": <claimed_amount>,
+    "network_discount": "20%" or null,
+    "after_discount": <number> or null,
+    "copay": "10%" or null,
+    "copay_amount": <number> or null,
+    "approved_amount": <number>
+  }
+}
+
+Be thorough. Use the policy terms exactly as provided. If eligible is false, provide clear rejection reasons."""
 
 
 class EvaluatePolicyTool(Tool):
-    EXCLUSION_KEYWORDS = {
-        "obesity": "Obesity and weight loss programs",
-        "bariatric": "Bariatric surgery",
-        "cosmetic": "Cosmetic or aesthetic procedures",
-        "self-inflicted": "Self-inflicted injuries",
-        "infertility": "Infertility and assisted reproduction",
-        "experimental": "Experimental treatments",
-    }
-
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession | None = None, policy_terms: dict | None = None):
         self.db = db
-        with open(POLICY_PATH) as f:
-            self.policy = json.load(f)
+        self.policy_terms = policy_terms
 
     @property
     def name(self) -> str:
@@ -29,7 +71,7 @@ class EvaluatePolicyTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Evaluate a claim against policy terms. Checks coverage, waiting periods, exclusions, pre-authorization, per-claim limits, sub-limits, and calculates approved amount with copay and network discounts."
+        return "Evaluate a claim against policy terms using an LLM. Checks coverage, waiting periods, exclusions, pre-auth, limits, and calculates approved amount."
 
     @property
     def parameters(self) -> dict:
@@ -40,12 +82,9 @@ class EvaluatePolicyTool(Tool):
                 "member_id": {"type": "string"},
                 "category": {"type": "string"},
                 "claimed_amount": {"type": "number"},
-                "treatment_date": {"type": "string", "format": "date"},
+                "treatment_date": {"type": "string"},
                 "hospital_name": {"type": "string"},
-                "extracted_docs": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                },
+                "extracted_docs": {"type": "array", "items": {"type": "object"}},
                 "ytd_claims_amount": {"type": "number"},
             },
             "required": ["claim_id", "member_id", "category", "claimed_amount", "treatment_date"],
@@ -62,233 +101,38 @@ class EvaluatePolicyTool(Tool):
         extracted_docs: list[dict] | None = None,
         ytd_claims_amount: float | None = None,
     ) -> dict:
-        checks = []
-        rejection_reasons = []
-        member = self._find_member(member_id)
-        treatment_date = date.fromisoformat(treatment_date) if isinstance(treatment_date, str) else treatment_date
-        category_config = self.policy["opd_categories"].get(category.lower())
+        member_info = None
+        if self.policy_terms:
+            for m in self.policy_terms.get("members", []):
+                if m.get("member_id") == member_id:
+                    member_info = m
+                    break
 
-        if not category_config or not category_config.get("covered", False):
-            checks.append({
-                "check_name": "coverage",
-                "status": "FAILED",
-                "details": {"category": category, "covered": False},
-            })
-            rejection_reasons.append("UNCOVERED_CATEGORY")
-            return self._result(False, 0, checks, rejection_reasons)
+        user_content = json.dumps({
+            "claim": {
+                "claim_id": claim_id,
+                "member_id": member_id,
+                "category": category,
+                "claimed_amount": claimed_amount,
+                "treatment_date": treatment_date,
+                "hospital_name": hospital_name,
+                "ytd_claims_amount": ytd_claims_amount,
+            },
+            "extracted_documents": extracted_docs or [],
+            "member_info": member_info,
+            "policy_terms": self.policy_terms,
+        }, indent=2, default=str)
 
-        checks.append({
-            "check_name": "coverage",
-            "status": "PASSED",
-            "details": {"category": category, "covered": True},
-        })
-        sub_limit = category_config.get("sub_limit")
-        copay = category_config.get("copay_percent", 0)
-        network_discount = category_config.get("network_discount_percent", 0)
+        result = await groq_client.structured_extract(POLICY_SYSTEM_PROMPT, user_content, max_tokens=4000)
 
-        wp_check = self._check_waiting_periods(member, treatment_date, extracted_docs)
-        checks.append(wp_check)
-        if wp_check["status"] == "FAILED":
-            rejection_reasons.append("WAITING_PERIOD")
+        if self.db:
+            for check in result.get("checks", []):
+                self.db.add(PolicyCheck(
+                    claim_id=claim_id,
+                    check_name=check["check_name"],
+                    status=check["status"],
+                    details=check.get("details"),
+                ))
+            await self.db.flush()
 
-        excl_check = self._check_exclusions(category, extracted_docs)
-        checks.append(excl_check)
-        if excl_check["status"] == "FAILED":
-            rejection_reasons.append("EXCLUDED_CONDITION")
-
-        preauth_check = self._check_pre_auth(category, claimed_amount, extracted_docs)
-        checks.append(preauth_check)
-        if preauth_check["status"] == "FAILED":
-            rejection_reasons.append("PRE_AUTH_MISSING")
-
-        per_claim_limit = self.policy["coverage"]["per_claim_limit"]
-        if claimed_amount > per_claim_limit:
-            checks.append({
-                "check_name": "per_claim_limit",
-                "status": "FAILED",
-                "details": {"limit": per_claim_limit, "claimed": claimed_amount},
-            })
-            rejection_reasons.append("PER_CLAIM_EXCEEDED")
-        else:
-            checks.append({
-                "check_name": "per_claim_limit",
-                "status": "PASSED",
-                "details": {"limit": per_claim_limit},
-            })
-
-        if sub_limit and claimed_amount > sub_limit:
-            checks.append({
-                "check_name": "sub_limit",
-                "status": "WARNING",
-                "details": {"sub_limit": sub_limit, "claimed": claimed_amount, "action": "Capping at sub_limit"},
-            })
-        else:
-            checks.append({
-                "check_name": "sub_limit",
-                "status": "PASSED" if not sub_limit else "PASSED",
-                "details": {"sub_limit": sub_limit},
-            })
-
-        eligible = len(rejection_reasons) == 0
-        approved = claimed_amount if eligible else 0.0
-        breakdown_details = {"original": claimed_amount}
-
-        if eligible:
-            if hospital_name and self._is_network_hospital(hospital_name):
-                discount = round(claimed_amount * network_discount / 100, 2)
-                after_discount = round(claimed_amount - discount, 2)
-                breakdown_details["network_discount"] = f"{network_discount}%"
-                breakdown_details["after_discount"] = after_discount
-                copay_amount = round(after_discount * copay / 100, 2)
-                approved = round(after_discount - copay_amount, 2)
-                breakdown_details["copay"] = f"{copay}%"
-                breakdown_details["copay_amount"] = copay_amount
-                breakdown_details["approved_amount"] = approved
-            else:
-                copay_amount = round(claimed_amount * copay / 100, 2)
-                approved = round(claimed_amount - copay_amount, 2)
-                breakdown_details["copay"] = f"{copay}%"
-                breakdown_details["copay_amount"] = copay_amount
-                breakdown_details["approved_amount"] = approved
-
-        for check in checks:
-            self.db.add(PolicyCheck(
-                claim_id=claim_id,
-                check_name=check["check_name"],
-                status=check["status"],
-                details=check["details"],
-            ))
-        await self.db.flush()
-
-        return {
-            "eligible": eligible,
-            "approved_amount_estimate": approved,
-            "checks": checks,
-            "network_discount_percent": network_discount,
-            "copay_percent": copay,
-            "rejection_reasons": rejection_reasons,
-            "breakdown_details": breakdown_details,
-        }
-
-    def _result(self, eligible, approved, checks, reasons):
-        return {
-            "eligible": eligible,
-            "approved_amount_estimate": approved,
-            "checks": checks,
-            "rejection_reasons": reasons,
-        }
-
-    def _find_member(self, member_id: str) -> dict | None:
-        for m in self.policy["members"]:
-            if m["member_id"] == member_id:
-                return m
-        return None
-
-    def _check_waiting_periods(self, member: dict | None, treatment_date: date, extracted_docs: list[dict] | None) -> dict:
-        if not member:
-            return {"check_name": "waiting_period", "status": "FAILED", "details": {"reason": "Member not found"}}
-        join_date = datetime.strptime(member["join_date"], "%Y-%m-%d").date()
-        days_since_join = (treatment_date - join_date).days
-        initial_wp = self.policy["waiting_periods"]["initial_waiting_period_days"]
-
-        if days_since_join < initial_wp:
-            return {
-                "check_name": "waiting_period",
-                "status": "FAILED",
-                "details": {"reason": "Initial waiting period", "eligible_from": join_date.isoformat(), "days_remaining": initial_wp - days_since_join},
-            }
-
-        if extracted_docs:
-            diagnosis = self._get_diagnosis_from_docs(extracted_docs)
-            specific_conditions = self.policy["waiting_periods"].get("specific_conditions", {})
-            condition_key = self._match_condition(diagnosis, specific_conditions)
-            if condition_key:
-                wp_days = specific_conditions[condition_key]
-                if days_since_join < wp_days:
-                    return {
-                        "check_name": "waiting_period",
-                        "status": "FAILED",
-                        "details": {"reason": f"Waiting period for {condition_key}", "condition": condition_key, "eligible_from": join_date.isoformat(), "days_remaining": wp_days - days_since_join},
-                    }
-
-        return {"check_name": "waiting_period", "status": "PASSED", "details": {"days_since_join": days_since_join}}
-
-    def _check_exclusions(self, category: str, extracted_docs: list[dict] | None) -> dict:
-        if not extracted_docs:
-            return {"check_name": "exclusions", "status": "PASSED", "details": {}}
-        diagnosis = self._get_diagnosis_from_docs(extracted_docs)
-        treatment = self._get_treatment_from_docs(extracted_docs)
-        conditions = self.policy["exclusions"].get("conditions", [])
-        all_text = (diagnosis + " " + treatment).lower()
-
-        for cond in conditions:
-            if cond.lower() in all_text:
-                return {"check_name": "exclusions", "status": "FAILED", "details": {"matched": cond, "condition": cond}}
-
-        for keyword, condition_name in self.EXCLUSION_KEYWORDS.items():
-            if keyword in all_text:
-                return {"check_name": "exclusions", "status": "FAILED", "details": {"matched": condition_name, "keyword": keyword}}
-
-        return {"check_name": "exclusions", "status": "PASSED", "details": {}}
-
-    def _check_pre_auth(self, category: str, claimed_amount: float, extracted_docs: list[dict] | None) -> dict:
-        if not extracted_docs:
-            return {"check_name": "pre_auth", "status": "PASSED", "details": {}}
-        treatment = self._get_treatment_from_docs(extracted_docs).lower()
-        tests_ordered = self._get_tests_from_docs(extracted_docs)
-        all_content = (treatment + " " + " ".join(tests_ordered)).lower()
-        pre_auth_config = self.policy.get("pre_authorization", {})
-        required_items = pre_auth_config.get("required_for", [])
-
-        for item in required_items:
-            item_lower = item.lower()
-            if item_lower in all_content:
-                if claimed_amount > 10000:
-                    return {
-                        "check_name": "pre_auth",
-                        "status": "FAILED",
-                        "details": {"required_for": item, "claimed_amount": claimed_amount, "threshold": 10000, "action": "Please obtain pre-authorization before resubmitting."},
-                    }
-        return {"check_name": "pre_auth", "status": "PASSED", "details": {}}
-
-    def _is_network_hospital(self, hospital_name: str) -> bool:
-        network = self.policy.get("network_hospitals", [])
-        return any(h.lower() in hospital_name.lower() or hospital_name.lower() in h.lower() for h in network)
-
-    def _get_diagnosis_from_docs(self, docs: list[dict]) -> str:
-        for doc in docs:
-            content = doc.get("extracted_content") or doc.get("content") or {}
-            if isinstance(content, dict):
-                diag = content.get("diagnosis", "")
-                if diag:
-                    return diag
-        return ""
-
-    def _get_treatment_from_docs(self, docs: list[dict]) -> str:
-        for doc in docs:
-            content = doc.get("extracted_content") or doc.get("content") or {}
-            if isinstance(content, dict):
-                treatment = content.get("treatment", "")
-                if treatment:
-                    return treatment
-                items = content.get("line_items", []) or content.get("medicines", [])
-                if items:
-                    return " ".join(i.get("description", str(i)) for i in items if isinstance(i, dict))
-        return ""
-
-    def _get_tests_from_docs(self, docs: list[dict]) -> list[str]:
-        for doc in docs:
-            content = doc.get("extracted_content") or doc.get("content") or {}
-            if isinstance(content, dict):
-                tests = content.get("tests_ordered", []) or content.get("test_name", "")
-                if isinstance(tests, str):
-                    return [tests]
-                return tests if isinstance(tests, list) else []
-        return []
-
-    def _match_condition(self, diagnosis: str, conditions: dict) -> str | None:
-        diag_lower = diagnosis.lower()
-        for condition, days in conditions.items():
-            if condition.lower() in diag_lower:
-                return condition
-        return None
+        return result

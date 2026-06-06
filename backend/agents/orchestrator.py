@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,6 +12,8 @@ from tools.fraud_tool import DetectFraudTool
 from tools.decision_tool import DecideClaimTool
 
 logger = logging.getLogger("plum.orchestrator")
+
+POLICY_PATH = Path(__file__).parent.parent / "data" / "policy_terms.json"
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are a health insurance claims processing orchestrator. Your job is to process a claim submission by calling tools in the correct order.
 
@@ -68,13 +71,21 @@ class OrchestratorAgent:
         self._tools: dict[str, object] = {}
         self._step_count = 0
         self._trace_updates = []
+        self._policy_terms = self._load_policy_terms()
+
+    def _load_policy_terms(self) -> dict | None:
+        path = POLICY_PATH
+        if path.exists():
+            with open(path) as f:
+                return json.load(f)
+        return None
 
     def _init_tools(self):
         extract = ExtractDocumentsTool(self.db)
         deep_extract = DeepExtractDocumentsTool(self.db)
-        validate = ValidateDocumentsTool(self.db)
-        policy = EvaluatePolicyTool(self.db)
-        fraud = DetectFraudTool(self.db)
+        validate = ValidateDocumentsTool(self.db, policy_terms=self._policy_terms)
+        policy = EvaluatePolicyTool(self.db, policy_terms=self._policy_terms)
+        fraud = DetectFraudTool(self.db, policy_terms=self._policy_terms)
         decision = DecideClaimTool(self.db)
 
         self._tools = {
