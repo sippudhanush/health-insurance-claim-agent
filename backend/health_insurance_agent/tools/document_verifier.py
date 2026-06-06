@@ -9,7 +9,7 @@ from agents import Agent, Runner, function_tool, ModelSettings
 
 logger = logging.getLogger("doc_verifier")
 
-CLASSIFY_VISION_PROMPT = """You are a medical document classifier. Analyze this document image and determine what type of medical document it is.
+CLASSIFY_VISION_PROMPT = """You are a medical document classifier. Analyze this document image and determine what type of medical document it is, and whether it is readable.
 
 Choose the single best matching type from:
 - PRESCRIPTION: A doctor's prescription or prescription slip listing medicines
@@ -20,11 +20,16 @@ Choose the single best matching type from:
 - DENTAL_REPORT: A dental examination or treatment report
 - DIAGNOSTIC_REPORT: A diagnostic imaging report (X-ray, MRI, CT scan, ultrasound)
 
+Also assess readability:
+- "GOOD" if text is clearly legible and document details can be extracted
+- "UNREADABLE" if the image is blurry, too dark, overexposed, cropped, or text cannot be read
+
 Also extract the patient name visible on the document.
 
 Return valid JSON:
 {
   "detected_type": "PRESCRIPTION",
+  "quality": "GOOD",
   "patient_name": "Extracted Name or null",
   "confidence": 0.95,
   "reasoning": "This is a prescription because it lists medicines with dosage instructions and has a doctor's stamp"
@@ -70,7 +75,7 @@ async def classify_document_with_vision(base64_content: str) -> str:
             }
         ],
         temperature=0.1,
-        max_tokens=300,
+        max_tokens=500,
     )
     raw = resp.choices[0].message.content or "{}"
     raw = raw.strip()
@@ -98,8 +103,9 @@ Steps:
 3) Compare vision_classification with doc_type_hint. If they differ, set type_mismatch=true,
    detected_type=vision_classification, and an error like:
    "You uploaded a {vision_classification} but labelled it as {doc_type_hint}. Please check."
-4) Check quality. If "UNREADABLE", mark valid=false with error:
+4) Read the quality field from the vision classification result. If "UNREADABLE", mark valid=false with error:
    "The document {filename} is unreadable. Please re-upload a clearer copy."
+   For docs without base64_content, use the input quality field as fallback.
 5) Read document_requirements for the claim_category from policy_terms. Verify ALL required
    document types are present using the vision_classification (not doc_type_hint).
 6) If extra/wrong document types are uploaded that are not in required or optional for this

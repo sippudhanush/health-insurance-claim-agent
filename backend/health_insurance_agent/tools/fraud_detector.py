@@ -26,18 +26,19 @@ Read thresholds from policy_terms.fraud_thresholds:
 - fraud_score_manual_review_threshold (default 0.80)
 
 Checks:
-1) CLAIM FREQUENCY: Count claims on same day and same month from claim_history.
+1) CLAIM FREQUENCY: Count total claims on same day (history + current). If total > same_day_claims_limit, flag.
+   Also count claims in same month. If total > monthly_claims_limit, flag.
 2) AMOUNT ANOMALY: Compare claimed_amount vs extracted document totals. Flag if >1% discrepancy.
 3) DUPLICATE: Check if identical (same type, same amount) claim exists in history.
 4) HIGH VALUE: Flag if > high_value_claim_threshold.
 
-Scoring:
-- Same-day flag: +0.3
-- Monthly limit flag: +0.2
+Scoring (cumulative):
+- Each same-day claim beyond the limit: +0.2 per excess claim
+- Monthly limit exceeded: +0.2
 - Amount discrepancy >10%: +0.3, 1-10%: +0.1
 - Duplicate: +0.4
 - High value: +0.2
-- Manual review if score >= fraud_score_manual_review_threshold
+- Manual review if score >= fraud_score_manual_review_threshold, OR if same-day excess >= 2 (unusual pattern)
 
 Output JSON:
 {
