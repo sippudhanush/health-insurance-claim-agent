@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-from typing import List, Optional, Set
+from typing import List, Optional
 from pydantic import BaseModel
 from agents import Agent, Runner, function_tool, ModelSettings
+
 
 class PolicyCheckItem(BaseModel):
     check_name: str
@@ -18,46 +19,61 @@ class PolicyCheckOut(BaseModel):
     network_discount_percent: float = 0.0
     copay_percent: float = 0.0
     rejection_reasons: List[str] = []
+    line_item_breakdown: Optional[List[dict]] = None
 
 
 INSTRUCTIONS = """
-You are PolicyChecker. Evaluate a health insurance claim against policy terms using the provided tools.
+You are PolicyChecker. Evaluate a claim against the provided policy_terms.
 
-Policy rules:
-1) WAITING PERIOD - Initial waiting period is 30 days from join_date. Specific conditions have longer waiting periods (diabetes: 90d, hypertension: 90d, etc.)
-2) SUB-LIMIT - Each category has a sub-limit: consultation=2000, diagnostic=10000, pharmacy=15000, dental=10000, vision=5000, alternative_medicine=8000
-3) PER-CLAIM LIMIT - Maximum 5000 per claim
-4) EXCLUSIONS - Self-inflicted injuries, war, substance abuse, experimental treatments, infertility, obesity/weight loss, bariatric surgery, cosmetic procedures, vaccination, health supplements
-5) PRE-AUTHORIZATION - Required for MRI (above 10000), CT scan (above 10000), PET scan, major surgical procedures
-6) CO-PAY - Consultation has 10% co-pay. Network hospitals give discount before co-pay.
-7) NETWORK HOSPITALS - Apollo, Fortis, Max, Manipal, Narayana, Medanta, Kokilaben, Aster, Columbia Asia, Sakra World
+Input includes:
+- claim: {member_id, claim_category, claimed_amount, treatment_date, hospital_name}
+- extracted_data: extracted document info (diagnosis, line_items[], total_amount, medicines[], ...)
+- member: {member_id, name, join_date, relationship, ...}
+- policy_terms: full policy configuration
 
-Selection rules:
-1) First check waiting period using join_date and treatment_date.
-2) Check exclusions against diagnosis and procedures.
-3) Check sub-limit against claimed amount for the category.
-4) Check per-claim-limit (5000 max).
-5) Check if pre-authorization is needed for high-value or specified procedures.
-6) Check if hospital is in-network for discount.
-7) Apply co-pay and network discount to compute final approved amount.
+Run these checks using values from policy_terms — do NOT hardcode:
 
-For each check, return status: "PASSED", "FAILED", or "WAIVED".
+1) WAITING PERIOD: Compare join_date + treatment_date. Check initial_waiting_period_days. Check specific_conditions (diabetes=90d, etc.) if diagnosis matches. On failure, state eligibility date.
 
-Final output JSON:
+2) PER-CLAIM LIMIT: Read per_claim_limit from policy_terms.coverage. If claimed_amount > per_claim_limit, reject with PER_CLAIM_EXCEEDED.
+
+3) SUB-LIMIT: Read category sub_limit from policy_terms.opd_categories[claim_category]. If claimed_amount > sub_limit, cap at sub_limit.
+
+4) EXCLUSIONS — LINE-ITEM LEVEL:
+   - Check EACH line item's description against exclusions:
+     - For DENTAL claims: check dental_exclusions list
+     - For VISION claims: check vision_exclusions list
+     - For all claims: check conditions list
+   - Build a line_item_breakdown: mark each item as approved:true or approved:false with reason
+   - Sum approved items' amounts for the approved_amount_estimate
+   - If some items excluded and some not, this is a PARTIAL approval — keep eligible=true but list rejection_reasons for excluded items
+
+5) PRE-AUTHORIZATION: If tests_ordered include MRI/CT/PET and amount > pre_auth_threshold from category config, require pre-auth. Reject with PRE_AUTH_MISSING.
+
+6) NETWORK HOSPITAL: Check hospital_name against policy_terms.network_hospitals. Set network_discount_percent if found.
+
+7) CO-PAY: Read copay_percent from category config. Apply network discount BEFORE co-pay.
+
+8) APPROVED AMOUNT: Start from sum of approved line items. Apply network discount, then co-pay. Cap at sub_limit if needed.
+
+Return "PASSED", "FAILED", or "WAIVED" per check.
+
+Output JSON:
 {
   "eligible": true/false,
   "approved_amount_estimate": <number|null>,
   "checks": [{"check_name": "...", "status": "PASSED|FAILED|WAIVED", "detail": "..."}],
   "network_discount_percent": <float>,
   "copay_percent": <float>,
-  "rejection_reasons": ["<reason>", ...]
+  "rejection_reasons": ["<reason>", ...],
+  "line_item_breakdown": [{"description": "...", "amount": <float>, "approved": true/false, "reason": "..."}]
 }
 """
 
 
 @function_tool
 async def check_policy(items: str) -> str:
-    items_list = json.loads(items) if isinstance(items, str) else (items or [])
+    raw = json.loads(items) if isinstance(items, str) else (items or {})
 
     agent = Agent(
         name="PolicyChecker",
@@ -69,7 +85,7 @@ async def check_policy(items: str) -> str:
 
     result = await Runner.run(
         agent,
-        input=json.dumps(items_list, ensure_ascii=False),
+        input=json.dumps(raw, ensure_ascii=False),
         max_turns=20,
     )
 

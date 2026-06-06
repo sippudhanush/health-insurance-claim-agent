@@ -12,46 +12,51 @@ class DecisionOut(BaseModel):
     confidence_score: float
     rejection_reasons: List[str] = []
     reasoning: str = ""
+    line_item_breakdown: Optional[List[dict]] = None
+    degradation_notes: List[str] = []
 
 
 INSTRUCTIONS = """
-You are DecisionMaker. Synthesise all upstream agent outputs into a final claim decision.
+You are DecisionMaker. Synthesise all upstream outputs into a final claim decision.
 
 Input includes:
-- claim (object) - original claim details
-- verification_result (object) - output from document verifier
-- extraction_result (object) - output from document extractor
-- policy_result (object) - output from policy checker
-- fraud_result (object) - output from fraud detector
+- claim: original claim details {claim_id, member_id, claim_category, claimed_amount, ...}
+- verification_result: output from document verifier
+- extraction_result: output from document extractor
+- policy_result: output from policy checker (includes line_item_breakdown, checks[])
+- fraud_result: output from fraud detector
+- policy_terms: full policy configuration
+- simulate_component_failure (optional): if true, one component may have degraded
 
 Decision rules:
-- REJECTED if: verification is not overall_valid, OR policy eligibility is false, OR exclusion matched, OR waiting period not served
-- MANUAL_REVIEW if: fraud_score >= 0.80 OR claimed_amount > 25000 OR verification/extraction/policy had DEGRADED status
-- APPROVED if: all checks pass, fraud score < 0.80, amount within limits
-- PARTIAL if: some policy checks pass but sub-limit or co-pay reduces the amount
+- REJECTED if: verification.overall_valid == false, OR policy.eligible == false (and no line items were approved)
+- PARTIAL if: policy_result has line_item_breakdown where some items approved and some rejected (e.g. cosmetic exclusion)
+- APPROVED if: all checks pass, fraud score < threshold, amount within limits
+- MANUAL_REVIEW if: fraud.manual_review_required == true, OR fraud.fraud_score >= threshold, OR claimed_amount > auto_manual_review_above
 
 Confidence scoring:
 - Start at 1.0
-- Deduct 0.1 for each DEGRADED agent
-- Deduct 0.2 if extraction confidence < 0.7
+- Deduct 0.1 for each FAILED policy check (unless it's an exclusion that only applies to specific line items)
+- Deduct 0.2 if extraction has any document with confidence < 0.7
 - Deduct 0.1 if fraud_score > 0.5
+- Deduct 0.15 if degradation_notes is non-empty
 
-Return ONLY the final JSON.
-
-Final output JSON:
+Output JSON:
 {
   "decision": "APPROVED|PARTIAL|REJECTED|MANUAL_REVIEW",
   "approved_amount": <number|null>,
   "confidence_score": <0.0-1.0>,
   "rejection_reasons": ["<reason>", ...],
-  "reasoning": "<step-by-step reasoning>"
+  "reasoning": "<step-by-step reasoning explaining exactly why this decision was made>",
+  "line_item_breakdown": [{"description": "...", "amount": <float>, "approved": true/false, "reason": "..."}],
+  "degradation_notes": ["<note>", ...]
 }
 """
 
 
 @function_tool
 async def decide_claim(items: str) -> str:
-    items_list = json.loads(items) if isinstance(items, str) else (items or [])
+    raw = json.loads(items) if isinstance(items, str) else (items or {})
 
     agent = Agent(
         name="DecisionMaker",
@@ -63,7 +68,7 @@ async def decide_claim(items: str) -> str:
 
     result = await Runner.run(
         agent,
-        input=json.dumps(items_list, ensure_ascii=False),
+        input=json.dumps(raw, ensure_ascii=False),
         max_turns=10,
     )
 

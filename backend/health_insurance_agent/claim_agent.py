@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List
 from pydantic import BaseModel
 from agents import Agent, Runner, ModelSettings, RunConfig, trace
@@ -23,6 +24,12 @@ if not logger.handlers:
 logger.setLevel(os.getenv("CLAIM_AGENT_LOG_LEVEL", "INFO"))
 
 AGENT_MODEL = os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini")
+POLICY_PATH = Path(__file__).resolve().parent.parent / "data" / "policy_terms.json"
+
+
+def load_policy_terms() -> dict:
+    with open(POLICY_PATH) as f:
+        return json.load(f)
 
 
 class ClaimOut(BaseModel):
@@ -32,69 +39,38 @@ class ClaimOut(BaseModel):
     confidence_score: float
     rejection_reasons: list[str] = []
     reasoning: str = ""
+    line_item_breakdown: list[dict] | None = None
+    degradation_notes: list[str] = []
     trace: dict = {}
 
 
 INSTRUCTIONS = """
-You are HealthInsuranceClaimProcessor. Use only the provided tools to process health insurance claims.
+You are HealthInsuranceClaimProcessor. Use tools to process health insurance claims.
 
-Tools available:
-- verify_documents(items) - Verify uploaded documents match claim category requirements
-- extract_documents(items) - Extract structured data from document images using vision AI
-- check_policy(items) - Evaluate claim against policy terms
-- detect_fraud(items) - Analyse the claim for fraud signals
-- decide_claim(items) - Make the final claim decision
+Tools:
+- verify_documents(items) — Verify uploaded docs against policy requirements
+- extract_documents(items) — Extract structured data from document images via vision AI
+- check_policy(items) — Evaluate claim against policy terms from policy_terms
+- detect_fraud(items) — Analyse fraud risk using policy fraud thresholds
+- decide_claim(items) — Make final decision. Call LAST.
 
-Important coordination rules:
-- Always pass all required fields to each tool. Each tool receives a JSON string with all relevant data.
-- The agent will NOT send precomputed lists or context beyond what's extracted.
+Important — Graceful Degradation:
+- If any tool call fails (returns an error), do NOT crash the pipeline.
+- Log what failed and continue with whatever data you have.
+- Pass the failure information downstream so the decision maker can lower confidence.
+- If simulate_component_failure is true in the input, one tool may fail intentionally — handle it gracefully.
 
-Data flow (strict):
-1) Document Verification
-   - Call: `verify_documents(items)`
-   - Input items: list of objects with keys:
-     - transaction_uuid (string)
-     - filename (string)
-     - doc_type_hint (string)
-     - claim_type (string)
-     - quality (string)
-   - Output: validates document types and checks required docs are present
-   - If overall_valid is false, STOP - return error
+Data flow:
+1) verify_documents: pass the documents + policy_terms. If overall_valid=false → STOP, return error immediately with specific messages about what's wrong.
+2) extract_documents: pass documents with base64 images. Handle extraction failures gracefully.
+3) check_policy: pass {claim, member, extracted_data, policy_terms} for all policy checks.
+4) detect_fraud: pass {member_id, claimed_amount, extracted_data, claim_history, policy_terms}.
+5) decide_claim: pass ALL outputs from steps 1-4 + original claim + policy_terms. Call LAST. Return its output.
 
-2) Document Extraction
-   - Call: `extract_documents(items)`
-   - Input items: list of objects with keys:
-     - transaction_uuid (string)
-     - doc_type (string)
-     - base64_content (string)
-   - Output: structured data from each document (diagnosis, medicines, totals, etc.)
+The input payload contains a "policy_terms" key with the full policy configuration.
+Use it everywhere — do NOT rely on hardcoded values.
 
-3) Policy Check
-   - Call: `check_policy(items)`
-   - Input includes: claim details, extracted data, member info, policy terms
-   - Output: eligibility, approved amount estimate, individual check results
-
-4) Fraud Detection
-   - Call: `detect_fraud(items)`
-   - Input includes: member_id, claimed_amount, extracted_data, claim_history
-   - Output: fraud_score, signals, manual_review_required flag
-
-5) Final Decision
-   - Call: `decide_claim(items)`
-   - Input: ALL outputs from steps 1-4 plus original claim
-   - Output: final decision, approved_amount, confidence, reasoning
-   - Call LAST - return its output as the final result
-
-Workflow summary (order of calls):
-- Start with raw claim data -> prepare minimal items and pass to verify_documents.
-- If verification fails, return error immediately.
-- Pass verified documents to extract_documents for vision extraction.
-- Pass claim + extracted data to check_policy and detect_fraud.
-- Pass everything to decide_claim for final synthesis.
-- Return the final decision output.
-
-Output format:
-Return ONLY the final JSON object from decide_claim.
+Return ONLY the final output from decide_claim.
 """
 
 
@@ -120,33 +96,66 @@ async def process_claim(claim_data: Dict[str, Any]) -> Dict[str, Any]:
     start = time.time()
     claim_id = claim_data.get("claim_id", "unknown")
 
+    policy_terms = load_policy_terms()
+
+    member = None
+    for m in policy_terms.get("members", []):
+        if m.get("member_id") == claim_data.get("member_id"):
+            member = m
+            break
+
+    payload: dict = {
+        "claim": {
+            "claim_id": claim_id,
+            "member_id": claim_data.get("member_id"),
+            "policy_id": claim_data.get("policy_id"),
+            "claim_category": claim_data.get("claim_category"),
+            "treatment_date": claim_data.get("treatment_date"),
+            "claimed_amount": claim_data.get("claimed_amount"),
+            "hospital_name": claim_data.get("hospital_name"),
+        },
+        "documents": claim_data.get("documents", []),
+        "claim_history": claim_data.get("claims_history", []),
+        "member": member or {},
+        "policy_terms": policy_terms,
+    }
+
+    if claim_data.get("simulate_component_failure"):
+        payload["simulate_component_failure"] = True
+
     with trace("Health Insurance Claim Processing", group_id=claim_id):
         logger.info("Processing claim: %s", claim_id)
-
         agent = build_agent()
-        res = await Runner.run(
-            agent,
-            input=json.dumps(claim_data, ensure_ascii=False),
-            max_turns=30,
-            run_config=RunConfig(workflow_name="Health Insurance Claim Agent"),
-        )
+        try:
+            res = await Runner.run(
+                agent,
+                input=json.dumps(payload, ensure_ascii=False),
+                max_turns=30,
+                run_config=RunConfig(workflow_name="Health Insurance Claim Agent"),
+            )
+            result = getattr(res, "final_output", res)
+        except Exception as e:
+            logger.error("Agent pipeline failed for %s: %s", claim_id, e)
+            result = {
+                "claim_id": claim_id,
+                "decision": "MANUAL_REVIEW",
+                "approved_amount": None,
+                "confidence_score": 0.3,
+                "rejection_reasons": ["SYSTEM_ERROR"],
+                "reasoning": f"Pipeline error: {e}",
+                "line_item_breakdown": None,
+                "degradation_notes": [f"Pipeline failed: {e}"],
+            }
 
-    result = getattr(res, "final_output", res)
     if isinstance(result, ClaimOut):
         output = result.model_dump()
     elif isinstance(result, dict):
         output = result
     else:
-        output = {"claim_id": claim_id, "decision": "ERROR", "confidence_score": 0.0, "trace": {}}
+        output = {"claim_id": claim_id, "decision": "ERROR", "confidence_score": 0.0}
 
     output.setdefault("claim_id", claim_id)
-    logger.info("Claim %s processed in %.2f seconds: %s", claim_id, time.time() - start, output.get("decision"))
+    output.setdefault("line_item_breakdown", None)
+    output.setdefault("degradation_notes", [])
+    logger.info("Claim %s done in %.2fs → %s", claim_id, time.time() - start, output.get("decision"))
     return output
-
-
-async def process_claim_batch(claims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    results = []
-    for claim_data in claims:
-        result = await process_claim(claim_data)
-        results.append(result)
-    return results

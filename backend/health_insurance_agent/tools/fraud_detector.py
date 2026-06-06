@@ -13,37 +13,36 @@ class FraudCheckOut(BaseModel):
 
 
 INSTRUCTIONS = """
-You are FraudDetector. Analyse the claim for fraud signals.
+You are FraudDetector. Analyse the claim for fraud signals using the provided policy_terms.fraud_thresholds.
 
 Input includes:
-- member_id (string)
-- claimed_amount (float)
-- extracted_data (object) - extracted document data with totals
-- claim_history (list) - previous claims with dates and amounts
-- fraud_thresholds (object) - configuration thresholds
+- member_id, claimed_amount, extracted_data, claim_history
+- policy_terms: includes fraud_thresholds
 
-Checks to perform:
-1) CLAIM FREQUENCY - Check if member has more than 2 claims on the same day or more than 6 in a month.
-2) AMOUNT ANOMALY - Compare claimed amount against extracted totals from documents. Flag if discrepancy > 1%.
-3) DUPLICATE CHECK - Check if an identical claim (same type, same amount) exists in history.
-4) HIGH VALUE - Flag claims above 25000 for manual review.
+Read thresholds from policy_terms.fraud_thresholds:
+- same_day_claims_limit (default 2)
+- monthly_claims_limit (default 6)
+- high_value_claim_threshold (default 25000)
+- fraud_score_manual_review_threshold (default 0.80)
+
+Checks:
+1) CLAIM FREQUENCY: Count claims on same day and same month from claim_history.
+2) AMOUNT ANOMALY: Compare claimed_amount vs extracted document totals. Flag if >1% discrepancy.
+3) DUPLICATE: Check if identical (same type, same amount) claim exists in history.
+4) HIGH VALUE: Flag if > high_value_claim_threshold.
 
 Scoring:
-- Start at 0.0
 - Same-day flag: +0.3
 - Monthly limit flag: +0.2
-- Amount discrepancy > 10%: +0.3
-- Amount discrepancy 1-10%: +0.1
-- Duplicate claim: +0.4
-- High value (>25000): +0.2
-- Manual review if fraud_score >= 0.80 OR claimed_amount > 25000
+- Amount discrepancy >10%: +0.3, 1-10%: +0.1
+- Duplicate: +0.4
+- High value: +0.2
+- Manual review if score >= fraud_score_manual_review_threshold
 
-Return ONLY the final JSON with no extra text.
-
-Final output JSON:
+Output JSON:
 {
   "fraud_score": <0.0-1.0>,
-  "signals": ["SAME_DAY_CLAIMS", "AMOUNT_MISMATCH", ...],
+  "signals": ["SAME_DAY_CLAIMS", ...],
   "manual_review_required": true/false
 }
 """
@@ -51,7 +50,7 @@ Final output JSON:
 
 @function_tool
 async def detect_fraud(items: str) -> str:
-    items_list = json.loads(items) if isinstance(items, str) else (items or [])
+    raw = json.loads(items) if isinstance(items, str) else (items or {})
 
     agent = Agent(
         name="FraudDetector",
@@ -63,7 +62,7 @@ async def detect_fraud(items: str) -> str:
 
     result = await Runner.run(
         agent,
-        input=json.dumps(items_list, ensure_ascii=False),
+        input=json.dumps(raw, ensure_ascii=False),
         max_turns=10,
     )
 

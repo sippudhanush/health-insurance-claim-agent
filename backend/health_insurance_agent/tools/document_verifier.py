@@ -5,6 +5,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 from agents import Agent, Runner, function_tool, ModelSettings
 
+
 class DocVerificationItem(BaseModel):
     transaction_uuid: str
     valid: bool
@@ -22,57 +23,34 @@ class DocVerificationOut(BaseModel):
 
 
 INSTRUCTIONS = """
-You are DocumentVerifier. For each uploaded document you MUST classify its type and verify it meets policy requirements for the given claim type.
+You are DocumentVerifier. For each uploaded document you MUST classify its type and verify it meets policy requirements.
 
-Input items include:
-- transaction_uuid (string)
-- filename (string)
-- doc_type_hint (string) - user-provided hint
-- claim_type (string) - the claim category
+Input payload includes:
+- documents: list of {transaction_uuid, filename, doc_type_hint, claim_type, quality, patient_name_on_doc}
+- policy_terms: dict containing document_requirements for each claim_type
 
 Steps:
-1) For each document, classify it into one of: PRESCRIPTION, HOSPITAL_BILL, LAB_REPORT, PHARMACY_BILL, DISCHARGE_SUMMARY, DENTAL_REPORT, DIAGNOSTIC_REPORT.
-2) Validate the document quality. If unreadable, mark as invalid.
-3) Check that all required documents for this claim_type are present.
-4) Check that no wrong/unsupported document types are uploaded.
-5) Return overall_valid = true only if ALL documents pass AND all required docs are present.
-
-Document requirements by claim type:
-- CONSULTATION: required=[PRESCRIPTION, HOSPITAL_BILL], optional=[LAB_REPORT, DIAGNOSTIC_REPORT]
-- DIAGNOSTIC: required=[PRESCRIPTION, LAB_REPORT, HOSPITAL_BILL], optional=[DISCHARGE_SUMMARY]
-- PHARMACY: required=[PRESCRIPTION, PHARMACY_BILL], optional=[]
-- DENTAL: required=[HOSPITAL_BILL], optional=[PRESCRIPTION, DENTAL_REPORT]
-- VISION: required=[PRESCRIPTION, HOSPITAL_BILL], optional=[]
-- ALTERNATIVE_MEDICINE: required=[PRESCRIPTION, HOSPITAL_BILL], optional=[]
-
-Hard forbiddens:
-- NEVER fabricate document types or validation results.
-- If quality is "UNREADABLE" or confidence is below 0.3, mark as invalid.
-- If patient names differ across documents, mark as patient name mismatch error.
-- Do NOT return extra fields beyond the schema.
+1) For each document, classify into: PRESCRIPTION, HOSPITAL_BILL, LAB_REPORT, PHARMACY_BILL, DISCHARGE_SUMMARY, DENTAL_REPORT, DIAGNOSTIC_REPORT.
+2) Check quality. If "UNREADABLE", mark valid=false with error "Unreadable document, please re-upload".
+3) Read document_requirements for this claim_type from policy_terms. Check required docs are present.
+4) Check no wrong/unsupported types uploaded.
+5) If patient names differ across documents, mark as mismatch error.
+6) Return overall_valid=true only if ALL pass AND all required docs present.
 
 Final output JSON:
 {
-  "transactions": [
-    {
-      "transaction_uuid": "<uuid>",
-      "valid": true/false,
-      "detected_type": "<doc_type|null>",
-      "quality": "GOOD|BLURRY|UNREADABLE",
-      "patient_name": "<name|null>",
-      "error": "<error_msg|null>"
-    }
-  ],
+  "transactions": [{"transaction_uuid": "...", "valid": true/false, "detected_type": "...", "quality": "...", "patient_name": "...", "error": "..."}],
   "overall_valid": true/false,
-  "missing_docs": ["<doc_type>", ...],
-  "wrong_docs": ["<doc_type>", ...]
+  "missing_docs": ["...", "..."],
+  "wrong_docs": ["...", "..."]
 }
 """
 
 
 @function_tool
 async def verify_documents(items: str) -> str:
-    items_list = json.loads(items) if isinstance(items, str) else (items or [])
+    raw = json.loads(items) if isinstance(items, str) else (items or {})
+    items_list = raw.get("documents", raw) if isinstance(raw, dict) else raw
 
     agent = Agent(
         name="DocumentVerifier",
@@ -84,7 +62,7 @@ async def verify_documents(items: str) -> str:
 
     result = await Runner.run(
         agent,
-        input=json.dumps({"documents": items_list}, ensure_ascii=False),
+        input=json.dumps(raw, ensure_ascii=False),
         max_turns=10,
     )
 
