@@ -18,7 +18,7 @@ class ExtractionAgent:
         for doc in documents:
             try:
                 content_for_llm = self._build_light_prompt(doc)
-                extracted = await groq_client.light_extract(content_for_llm)
+                extracted = await groq_client.light_extract(content_for_llm, trace_id=claim_id)
                 result = LightExtractionResult(
                     file_id=doc["file_id"],
                     detected_type=extracted.get(
@@ -67,6 +67,7 @@ class ExtractionAgent:
                 extracted = await groq_client.deep_extract(
                     doc.get("detected_type", doc.get("actual_type", "UNKNOWN")),
                     content,
+                    trace_id=claim_id,
                 )
                 confidence = (
                     extracted.pop("confidence", 0.9)

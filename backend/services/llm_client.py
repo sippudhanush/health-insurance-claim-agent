@@ -1,6 +1,7 @@
 import json
 from httpx import AsyncClient
 from core.config import settings
+from services.langfuse_client import langfuse
 
 GROQ_API_BASE = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -59,14 +60,40 @@ class GroqClient:
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
-    async def light_extract(self, file_description: str) -> dict:
-        raw = await self._call(LIGHT_EXTRACTION_PROMPT, file_description)
-        return json.loads(raw)
+    async def light_extract(self, file_description: str, trace_id: str | None = None) -> dict:
+        span = langfuse.span(
+            name="light_extract",
+            trace_id=trace_id,
+            input={"file_description": file_description},
+        ) if trace_id else None
+        try:
+            raw = await self._call(LIGHT_EXTRACTION_PROMPT, file_description)
+            result = json.loads(raw)
+            if span:
+                span.end(output=result)
+            return result
+        except Exception as e:
+            if span:
+                span.end(level="ERROR", output={"error": str(e)})
+            raise
 
-    async def deep_extract(self, doc_type: str, file_content: str) -> dict:
+    async def deep_extract(self, doc_type: str, file_content: str, trace_id: str | None = None) -> dict:
         prompt = DEEP_EXTRACTION_PROMPT + f"\n\nDocument type: {doc_type}"
-        raw = await self._call(prompt, file_content)
-        return json.loads(raw)
+        span = langfuse.span(
+            name="deep_extract",
+            trace_id=trace_id,
+            input={"doc_type": doc_type, "file_content": file_content},
+        ) if trace_id else None
+        try:
+            raw = await self._call(prompt, file_content)
+            result = json.loads(raw)
+            if span:
+                span.end(output=result)
+            return result
+        except Exception as e:
+            if span:
+                span.end(level="ERROR", output={"error": str(e)})
+            raise
 
 
 groq_client = GroqClient()

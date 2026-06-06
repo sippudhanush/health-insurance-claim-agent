@@ -6,6 +6,24 @@ import os
 
 API_BASE = os.getenv("API_BASE", "http://backend:8000")
 
+
+def fetch_policy():
+    try:
+        resp = httpx.get(f"{API_BASE}/api/policy", timeout=10.0)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return {}
+
+
+if "policy" not in st.session_state:
+    st.session_state.policy = fetch_policy()
+
+policy = st.session_state.policy
+members = policy.get("members", [])
+doc_req = policy.get("document_requirements", {})
+
 st.set_page_config(page_title="Plum Claims Processing", layout="wide")
 
 st.markdown("""
@@ -32,64 +50,78 @@ st.markdown("Submit a health insurance claim and get an automated decision with 
 tab1, tab2 = st.tabs(["Submit Claim", "View Claim"])
 
 with tab1:
+    claim_category = st.selectbox(
+        "Claim Category",
+        ["CONSULTATION", "DIAGNOSTIC", "PHARMACY", "DENTAL", "VISION", "ALTERNATIVE_MEDICINE"],
+        key="claim_category_select",
+    )
+
     with st.form("claim_form"):
         col1, col2 = st.columns(2)
         with col1:
-            member_id = st.text_input("Member ID", value="EMP001")
+            if members:
+                member_options = {f"{m['member_id']} — {m['name']}": m["member_id"] for m in members}
+                selected_label = st.selectbox("Member", options=list(member_options.keys()))
+                member_id = member_options[selected_label]
+            else:
+                member_id = st.text_input("Member ID", value="EMP001")
+                st.caption("Members not loaded — enter manually.")
             policy_id = st.text_input("Policy ID", value="PLUM_GHI_2024")
-            claim_category = st.selectbox(
-                "Claim Category",
-                ["CONSULTATION", "DIAGNOSTIC", "PHARMACY", "DENTAL", "VISION", "ALTERNATIVE_MEDICINE"],
-            )
-            claimed_amount = st.number_input("Claimed Amount (₹)", min_value=0, value=1500, step=100)
         with col2:
             treatment_date = st.date_input("Treatment Date", value=date(2024, 11, 1))
-            hospital_name = st.text_input("Hospital Name (optional)")
-            ytd_amount = st.number_input("YTD Claims (₹, optional)", min_value=0, value=0, step=100)
-            simulate_failure = st.checkbox("Simulate Component Failure")
+            claimed_amount = st.number_input("Claimed Amount (₹)", min_value=0, value=1500, step=100)
 
         st.subheader("Documents")
-        doc_count = st.number_input("Number of documents", min_value=1, max_value=5, value=2)
 
+        category_req = doc_req.get(claim_category, {})
         documents = []
-        for i in range(doc_count):
-            st.markdown(f"**Document {i+1}**")
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                file_id = st.text_input(f"File ID", value=f"F00{i+1}", key=f"fid_{i}")
-            with c2:
-                actual_type = st.selectbox(
-                    f"Document Type",
-                    ["", "PRESCRIPTION", "HOSPITAL_BILL", "LAB_REPORT", "PHARMACY_BILL", "DISCHARGE_SUMMARY", "DENTAL_REPORT"],
-                    key=f"type_{i}",
-                )
-            with c3:
-                quality = st.selectbox(f"Quality", ["GOOD", "PARTIAL", "UNREADABLE"], key=f"qual_{i}")
-            with c4:
-                patient_name = st.text_input(f"Patient Name", key=f"pat_{i}")
 
-            use_json = st.checkbox(f"Provide structured content for doc {i+1}", key=f"json_{i}")
-            content_str = ""
-            if use_json:
-                content_str = st.text_area(
-                    f"Content (JSON)", value='{"diagnosis": "Viral Fever", "doctor_name": "Dr. Sharma"}',
-                    key=f"content_{i}", height=80,
-                )
+        if category_req:
+            for doc_type in category_req.get("required", []):
+                st.markdown(f"##### {doc_type} *(Required)*")
+                c1, c2 = st.columns(2)
+                with c1:
+                    fid = st.text_input("File ID", value=f"{doc_type[:4]}_001", key=f"req_{doc_type}_fid")
+                    st.markdown(f"**Type:** {doc_type}")
+                with c2:
+                    pname = st.text_input("Patient Name", key=f"req_{doc_type}_pname")
 
-            doc = {"file_id": file_id}
-            if actual_type:
-                doc["actual_type"] = actual_type
-            if quality:
-                doc["quality"] = quality
-            if patient_name:
-                doc["patient_name_on_doc"] = patient_name
-            if content_str:
-                try:
+                use_json = st.checkbox("Add structured content", key=f"req_{doc_type}_json")
+                content_str = ""
+                if use_json:
+                    content_str = st.text_area("Content (JSON)", key=f"req_{doc_type}_content", height=80)
+
+                doc = {"file_id": fid, "actual_type": doc_type}
+                if pname:
+                    doc["patient_name_on_doc"] = pname
+                if content_str:
                     doc["content"] = json.loads(content_str)
-                except json.JSONDecodeError:
-                    st.error(f"Invalid JSON in document {i+1}")
-            documents.append(doc)
-            st.divider()
+                documents.append(doc)
+                st.divider()
+
+            for doc_type in category_req.get("optional", []):
+                st.markdown(f"##### {doc_type} *(Optional)*")
+                c1, c2 = st.columns(2)
+                with c1:
+                    fid = st.text_input("File ID", value=f"{doc_type[:4]}_001", key=f"opt_{doc_type}_fid")
+                    st.markdown(f"**Type:** {doc_type}")
+                with c2:
+                    pname = st.text_input("Patient Name", key=f"opt_{doc_type}_pname")
+
+                use_json = st.checkbox("Add structured content", key=f"opt_{doc_type}_json")
+                content_str = ""
+                if use_json:
+                    content_str = st.text_area("Content (JSON)", key=f"opt_{doc_type}_content", height=80)
+
+                doc = {"file_id": fid, "actual_type": doc_type}
+                if pname:
+                    doc["patient_name_on_doc"] = pname
+                if content_str:
+                    doc["content"] = json.loads(content_str)
+                documents.append(doc)
+                st.divider()
+        else:
+            st.info("No document requirements defined for this category.")
 
         submitted = st.form_submit_button("Submit Claim")
 
@@ -101,8 +133,6 @@ with tab1:
             "treatment_date": treatment_date.isoformat(),
             "claimed_amount": claimed_amount,
             "hospital_name": hospital_name or None,
-            "ytd_claims_amount": ytd_amount or None,
-            "simulate_component_failure": simulate_failure or None,
             "documents": documents,
         }
 

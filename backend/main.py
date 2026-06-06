@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
+import json
 
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +18,7 @@ from agents.fraud_agent import FraudAgent
 from agents.decision_agent import DecisionEngineAgent
 
 from models.claim import Claim
+from services.langfuse_client import langfuse
 
 
 @asynccontextmanager
@@ -44,10 +47,21 @@ async def submit_claim(input_data: ClaimInput, db: AsyncSession = Depends(get_db
     db.add(claim)
     await db.flush()
 
+    root_trace = langfuse.trace(
+        id=claim.id,
+        name="claim-processing",
+        input={
+            "member_id": input_data.member_id,
+            "category": input_data.claim_category,
+            "claimed_amount": input_data.claimed_amount,
+        },
+    )
+
     # Stage 1: Light Extraction
     extraction_agent = ExtractionAgent(db)
     doc_dicts = [d.model_dump() for d in input_data.documents]
     light_results = await extraction_agent.light_extract(claim.id, doc_dicts)
+    root_trace.span(name="light_extraction", output={"document_count": len(light_results)})
 
     # Stage 2: Document Validation (early exit for doc problems)
     validation_agent = ValidationAgent()
@@ -59,6 +73,8 @@ async def submit_claim(input_data: ClaimInput, db: AsyncSession = Depends(get_db
         claim.status = "DOCUMENT_ERROR"
         db.add(claim)
         await db.commit()
+        root_trace.span(name="validation", output={"status": "FAILED", "errors": [e.code for e in validation_result.errors]})
+        langfuse.flush()
 
         if validation_result.errors:
             err = validation_result.errors[0]
@@ -71,6 +87,8 @@ async def submit_claim(input_data: ClaimInput, db: AsyncSession = Depends(get_db
                     "claim_id": claim.id,
                 },
             )
+
+    root_trace.span(name="validation", output={"status": "PASSED"})
 
     # Stage 3: Deep Extraction
     deep_results = await extraction_agent.deep_extract(
@@ -87,6 +105,7 @@ async def submit_claim(input_data: ClaimInput, db: AsyncSession = Depends(get_db
             for r, d in zip(light_results, input_data.documents)
         ],
     )
+    root_trace.span(name="deep_extraction", output={"document_count": len(deep_results)})
 
     # Stage 4: Policy Evaluation
     policy_agent = PolicyAgent(db)
@@ -100,6 +119,7 @@ async def submit_claim(input_data: ClaimInput, db: AsyncSession = Depends(get_db
         extracted_docs=deep_results,
         ytd_claims_amount=input_data.ytd_claims_amount,
     )
+    root_trace.span(name="policy_evaluation", output={"eligible": policy_result.eligible})
 
     # Stage 5: Fraud Detection
     fraud_agent = FraudAgent(db)
@@ -110,6 +130,7 @@ async def submit_claim(input_data: ClaimInput, db: AsyncSession = Depends(get_db
         treatment_date=input_data.treatment_date,
         claims_history=input_data.claims_history,
     )
+    root_trace.span(name="fraud_detection", output={"fraud_score": fraud_result.fraud_score})
 
     # Stage 6: Decision Engine
     decision_agent = DecisionEngineAgent(db)
@@ -131,6 +152,10 @@ async def submit_claim(input_data: ClaimInput, db: AsyncSession = Depends(get_db
     claim.trace = decision_output.trace
     db.add(claim)
     await db.commit()
+
+    root_trace.span(name="decision", output={"decision": decision_output.decision, "approved_amount": decision_output.approved_amount})
+    root_trace.update(output={"status": decision_output.decision, "claim_id": claim.id})
+    langfuse.flush()
 
     return ClaimResponse(claim_id=claim.id, status=claim.status)
 
@@ -165,6 +190,14 @@ async def get_claim_trace(claim_id: str, db: AsyncSession = Depends(get_db)):
         confidence_score=claim.confidence_score,
         trace=claim.trace,
     )
+
+
+@app.get("/api/policy")
+async def get_policy():
+    path = Path(__file__).parent / "data" / "policy_terms.json"
+    with open(path) as f:
+        policy = json.load(f)
+    return policy
 
 
 @app.get("/health")
