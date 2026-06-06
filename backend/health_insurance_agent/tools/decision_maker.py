@@ -64,7 +64,7 @@ async def decide_claim(items: str) -> str:
         instructions=INSTRUCTIONS,
         model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
         output_type=AgentOutputSchema(DecisionOut, strict_json_schema=False),
-        model_settings=ModelSettings(reasoning={"effort": "low"}),
+        model_settings=ModelSettings(),
     )
 
     result = await Runner.run(

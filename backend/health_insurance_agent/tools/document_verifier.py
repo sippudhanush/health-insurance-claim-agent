@@ -151,7 +151,7 @@ async def _run_verification(items: str) -> str:
         model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
         tools=[classify_document_with_vision],
         output_type=AgentOutputSchema(DocVerificationOut, strict_json_schema=False),
-        model_settings=ModelSettings(reasoning={"effort": "low"}),
+        model_settings=ModelSettings(),
     )
 
     result = await Runner.run(

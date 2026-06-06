@@ -122,7 +122,7 @@ async def extract_documents(items: str) -> str:
         model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
         tools=[extract_with_vision],
         output_type=AgentOutputSchema(ExtractionOut, strict_json_schema=False),
-        model_settings=ModelSettings(reasoning={"effort": "low"}),
+        model_settings=ModelSettings(),
     )
 
     result = await Runner.run(
