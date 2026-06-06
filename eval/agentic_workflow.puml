@@ -5,7 +5,7 @@ skinparam sequenceMessageAlign center
 skinparam participantPadding 20
 skinparam boxPadding 10
 
-title Plum Claims Processing — Pipeline-of-Agents
+title Plum Claims Processing — Multi-Agent Orchestration (ReAct)
 
 actor "Member" as MEMBER
 actor "Ops Team" as OPS
@@ -14,25 +14,26 @@ box "Frontend" #E8F4FD
   participant "Streamlit UI" as UI
 end box
 
-box "Backend API" #F0E6FF
-  participant "Orchestrator\n(FastAPI)" as ORCH
+box "Orchestrator Layer" #F0E6FF
+  participant "Orchestrator Agent\n(LLM-powered)" as ORCH
+  entity "Groq API\n(Llama3-70b)\n[Function Calling]" as GROQ_ORCH
 end box
 
-box "Pipeline Agents" #E8FFE8
-  participant "Extraction Agent\n(Light Pass)" as EA_LIGHT
-  participant "Validation Agent\n(Intake)" as VA
-  participant "Extraction Agent\n(Deep Pass)" as EA_DEEP
-  participant "Policy Agent" as PA
-  participant "Fraud Agent" as FA
-  participant "Decision Agent" as DA
+box "Tools (Agents)" #E8FFE8
+  participant "extract_documents\n[Tool]" as EXT
+  participant "validate_documents\n[Tool]" as VAL
+  participant "deep_extract_documents\n[Tool]" as DEEP
+  participant "evaluate_policy\n[Tool]" as POL
+  participant "detect_fraud\n[Tool]" as FRAUD
+  participant "decide_claim\n[Tool]" as DEC
 end box
 
 box "Infrastructure" #FFF3E0
   database "PostgreSQL" as DB
-  entity "Groq API\n(Llama3)" as GROQ
+  entity "Groq API\n(Llama3)" as GROQ_EXT
 end box
 
-== 1. Claim Submission (Streaming) ==
+== 1. Claim Submission (SSE Stream) ==
 MEMBER -> UI: Upload docs + fill form
 UI -> ORCH: POST /api/claims [Accept: text/event-stream]
 ORCH -> DB: INSERT claim (status=PROCESSING)
@@ -40,119 +41,154 @@ ORCH --> UI: SSE: { claim_id, status: PROCESSING }
 note right #E8F4FD: SSE stream opened — live updates follow
 UI --> MEMBER: "Processing claim..."
 
-== 2. Light Extraction + Validation (Early Exit) ==
-ORCH --> UI: SSE: { step: "extraction", status: "running" }
-ORCH -> EA_LIGHT: light_extract(files[])
-EA_LIGHT -> GROQ: Classify doc type, assess quality, extract patient name
-GROQ --> EA_LIGHT: { doc_type, quality, patient_name, confidence }
-EA_LIGHT --> ORCH: per-file metadata
-ORCH --> UI: SSE: { step: "extraction", status: "done", files: N }
+== 2. ReAct Loop: Orchestrator Decides Workflow ==
+note right #F0E6FF
+  Orchestrator receives claim info +
+  system prompt with tool definitions.
+  Calls Groq with function calling —
+  LLM decides which tool(s) to call next.
+  Each tool result feeds back as a
+  "tool" message. Loop continues until
+  decide_claim is called or error occurs.
+end note
 
+ORCH -> GROQ_ORCH: [system] tool definitions + workflow rules\n[user] claim details + "start processing"
+GROQ_ORCH --> ORCH: tool_call: extract_documents({claim_id, documents})
+
+== 3. Tool: extract_documents ==
+ORCH --> UI: SSE: { step: "extraction", status: "running" }
+ORCH -> EXT: extract_documents(claim_id, documents)
+EXT -> GROQ_EXT: Classify doc type, assess quality, extract patient name
+GROQ_EXT --> EXT: { doc_type, quality, patient_name, confidence }
+EXT -> DB: INSERT Document records
+EXT --> ORCH: { documents: [...], count: N, degraded: bool }
+
+alt LLM fails
+  EXT --> ORCH: degraded=true, fallback metadata
+  note right #FFF3CD: Degraded mode — confidence drops
+end
+
+ORCH --> UI: SSE: { step: "extraction", status: "done", files: N }
+ORCH -> GROQ_ORCH: tool_result: extraction complete\n→ LLM decides next step
+GROQ_ORCH --> ORCH: tool_call: validate_documents({category, documents})
+
+== 4. Tool: validate_documents (Early Exit) ==
 ORCH --> UI: SSE: { step: "validation", status: "running" }
-ORCH -> VA: validate_documents(category, extracted_meta[])
-VA -> VA: Check types match category requirements
-VA -> VA: Check quality scores
-VA -> VA: Check patient name consistency
+ORCH -> VAL: validate_documents(category, documents)
+VAL -> VAL: Check types match category requirements
+VAL -> VAL: Check quality scores
+VAL -> VAL: Check patient name consistency
 
 alt [Early Exit] Validation Fails
-  VA --> ORCH: ValidationError(wrong_type | unreadable | patient_mismatch)
-  ORCH --> UI: SSE: { step: "validation", status: "failed", error: "..." }
-  ORCH --> UI: 422 + specific, actionable message
+  VAL --> ORCH: { valid: false, errors: [...] }
+  ORCH --> UI: SSE: { step: "validation", status: "failed", errors }
+  ORCH --> UI: error event with specific actionable message
   UI --> MEMBER: Show error (e.g. "Expected HOSPITAL_BILL, got PRESCRIPTION")
   note right #FFB3B3: TC001 / TC002 / TC003 — stops here
 else [Valid]
-  VA --> ORCH: validation_passed
+  VAL --> ORCH: { valid: true, errors: [] }
   ORCH --> UI: SSE: { step: "validation", status: "passed" }
+  ORCH -> GROQ_ORCH: tool_result: validation passed
+  GROQ_ORCH --> ORCH: tool_call: deep_extract_documents({claim_id, documents})
 end
 
-== 3. Deep Extraction ==
+== 5. Tool: deep_extract_documents ==
 ORCH --> UI: SSE: { step: "deep_extraction", status: "running" }
-ORCH -> EA_DEEP: deep_extract(claim_id, validated_docs)
-EA_DEEP -> GROQ: Extract all fields (diagnosis, line items, amounts, doctor, dates)
-GROQ --> EA_DEEP: structured JSON per document
+ORCH -> DEEP: deep_extract_documents(claim_id, validated_docs)
+DEEP -> GROQ_EXT: Extract structured data (diagnosis, medicines, line items, etc.)
+GROQ_EXT --> DEEP: structured JSON per document type
 
 alt [Degraded] LLM timeout/parse failure
-  EA_DEEP --> ORCH: partial_data + low_confidence
+  DEEP --> ORCH: degraded=true, partial extraction
   note right #FFF3CD: TC011 — graceful degradation
-  ORCH --> UI: SSE: { step: "deep_extraction", status: "degraded", confidence: low }
+  ORCH --> UI: SSE: { step: "deep_extraction", status: "degraded" }
 else [Success]
-  EA_DEEP --> ORCH: full_extracted_data
+  DEEP --> ORCH: full_extracted_data
   ORCH --> UI: SSE: { step: "deep_extraction", status: "done" }
 end
-EA_DEEP -> DB: INSERT extracted_docs
+DEEP -> DB: UPDATE Document (extracted_content, confidence)
 
-== 4. Policy Rules ==
+ORCH -> GROQ_ORCH: tool_result: deep extraction complete
+GROQ_ORCH --> ORCH: tool_call: evaluate_policy({...})  +  tool_call: detect_fraud({...})
+note right #F0E6FF
+  LLM can call multiple tools
+  in parallel since policy and
+  fraud are independent.
+end note
+
+== 6. Tool: evaluate_policy ==
 ORCH --> UI: SSE: { step: "policy", status: "running" }
-ORCH -> PA: evaluate_policy(member_id, category, extracted_data)
-PA -> DB: LOAD policy_terms.json, member info
-group Policy Checks (parallel)
-  PA -> PA: Coverage check
-  PA -> PA: Waiting period check (TC005)
-  PA -> PA: Exclusion check (TC012)
-  PA -> PA: Pre-auth check (TC007)
-  PA -> PA: Per-claim limit check (TC008)
-  PA -> PA: Sub-limit check
-  PA -> PA: Network discount calc (TC010)
-  PA -> PA: Co-pay calc
+ORCH -> POL: evaluate_policy(member_id, category, amount, extracted_docs)
+POL -> DB: LOAD policy_terms.json, member info
+group Policy Checks
+  POL -> POL: Coverage check
+  POL -> POL: Waiting period check (TC005)
+  POL -> POL: Exclusion check (TC012)
+  POL -> POL: Pre-auth check (TC007)
+  POL -> POL: Per-claim limit check (TC008)
+  POL -> POL: Sub-limit check
+  POL -> POL: Network discount calc (TC010)
+  POL -> POL: Co-pay calc
 end
 
 alt Any check rejects
-  PA --> ORCH: policy_rejection(reasons[], eligibility_dates)
+  POL --> ORCH: { eligible: false, rejection_reasons, checks }
   ORCH --> UI: SSE: { step: "policy", status: "rejected", reasons }
 else All pass (possibly partial)
-  PA --> ORCH: policy_ok(approved_estimate, copay, discount)
+  POL --> ORCH: { eligible: true, approved_amount_estimate, checks }
   ORCH --> UI: SSE: { step: "policy", status: "passed" }
 end
-PA -> DB: INSERT policy_results
+POL -> DB: INSERT PolicyCheck records
 
-== 5. Fraud Detection ==
+== 7. Tool: detect_fraud ==
 ORCH --> UI: SSE: { step: "fraud", status: "running" }
-ORCH -> FA: detect_fraud(member_id, claim_amount)
-FA -> DB: SELECT claims_history (same-day, same-month, high-value)
-FA -> FA: Compare against fraud_thresholds
+ORCH -> FRAUD: detect_fraud(member_id, amount, treatment_date)
+FRAUD -> DB: SELECT claims_history (same-day, same-month, high-value)
+FRAUD -> FRAUD: Compare against fraud thresholds
 
-alt Fraud score > threshold
-  FA --> ORCH: fraud_signals[same_day_exceeded], score=0.85
+alt Fraud score >= 0.8
+  FRAUD --> ORCH: { fraud_score: 0.85, signals, flagged: true }
   note right #FFE0E0: TC009 — routed to manual review
   ORCH --> UI: SSE: { step: "fraud", status: "flagged", score: 0.85 }
 else No signals
-  FA --> ORCH: fraud_score=0.02
-  ORCH --> UI: SSE: { step: "fraud", status: "passed", score: 0.02 }
+  FRAUD --> ORCH: { fraud_score: 0.0, signals: [], flagged: false }
+  ORCH --> UI: SSE: { step: "fraud", status: "passed", score: 0.0 }
 end
-FA -> DB: INSERT fraud_results
+FRAUD -> DB: INSERT FraudCheck record
 
-== 6. Decision Engine ==
+ORCH -> GROQ_ORCH: tool_results: policy + fraud complete
+GROQ_ORCH --> ORCH: tool_call: decide_claim({all accumulated results})
+
+== 8. Tool: decide_claim ==
 ORCH --> UI: SSE: { step: "decision", status: "running" }
-ORCH -> DA: decide(validation, extraction, policy, fraud)
-
-DA -> DA: Aggregate all agent outputs
+ORCH -> DEC: decide_claim(claim_id, validation, extraction, deep_extraction, policy, fraud)
 
 note right #D4E6F1
   Decision Matrix:
-  Policy reject? -> REJECTED
-  Fraud > 0.8?  -> MANUAL_REVIEW
-  Partial amt?  -> PARTIAL
-  All clear?    -> APPROVED
+  Validation failed? -> REJECTED
+  Fraud >= 0.8?     -> MANUAL_REVIEW
+  Policy rejected?  -> REJECTED
+  Partial amount?   -> PARTIAL
+  All clear?        -> APPROVED
+  Degraded mode -> confidence penalty
 end note
 
-alt Degraded mode (TC011)
-  DA -> DA: Reduce confidence, append degradation note
-end
+DEC --> ORCH: { decision, approved_amount, confidence, trace, breakdown }
+DEC -> DB: INSERT DecisionRecord + full trace
 
-DA --> ORCH: final_decision {\n  decision, approved_amount,\n  reasons[], trace[],\n  confidence_score\n}
-ORCH -> DB: INSERT decision + full trace
+ORCH -> DB: UPDATE Claim (status, decision, trace)
 ORCH --> UI: SSE: { decision, approved_amount, trace, breakdown }
 ORCH --> UI: SSE: [DONE]
 UI --> MEMBER: Show result + expandable trace + live log
 
 alt MANUAL_REVIEW
-  UI --> OPS: Notify team
+  UI --> OPS: Notify team for review
   OPS -> UI: Review trace, approve/override
 end
 
-== 7. Explainability (Always Available) ==
+== 9. Explainability (Always Available) ==
 OPS -> ORCH: GET /api/claims/{id}/trace
 ORCH -> DB: SELECT trace
-ORCH --> OPS: Full step-by-step breakdown
+ORCH --> OPS: Full step-by-step breakdown with all tool results
 
 @enduml
