@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "backend"))
 
 from health_insurance_agent.claim_agent import process_claim
 
-TC001_DIR = Path(__file__).resolve().parent / "Plum Assignment - 12-04-2026" / "test_case_inputs" / "TC001_Wrong_Document_Uploaded"
+TC001_DIR = Path(__file__).resolve().parent / "tests" / "fixtures" / "TC001_Wrong_Document_Uploaded"
 
 
 def encode_file(path: Path) -> str:
