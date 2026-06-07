@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -17,6 +18,11 @@ from health_insurance_agent.tools.document_extractor import extract_documents
 from health_insurance_agent.tools.policy_checker import check_policy
 from health_insurance_agent.tools.fraud_detector import detect_fraud
 from health_insurance_agent.tools.decision_maker import decide_claim
+from health_insurance_agent.tools.file_handlers import (
+    upload_file,
+    delete_uploaded_file,
+    is_pdf,
+)
 
 logger = logging.getLogger("claim_agent")
 if not logger.handlers:
@@ -59,12 +65,18 @@ class ClaimOut(BaseModel):
 INSTRUCTIONS = """
 You are HealthInsuranceClaimProcessor. Use tools to process health insurance claims.
 
+CRITICAL RULE — STOP ON VERIFICATION FAILURE:
+You MUST call verify_documents FIRST. If its output has overall_valid=false,
+you MUST STOP immediately. Do NOT call any other tool.
+Return the error with missing_docs and wrong_docs info to the user.
+
 Tools:
-- verify_documents(items) — Verify uploaded docs against policy requirements
-- extract_documents(items) — Extract structured data from document images via vision AI
-- check_policy(items) — Evaluate claim against policy terms from policy_terms
-- detect_fraud(items) — Analyse fraud risk using policy fraud thresholds
-- decide_claim(items) — Make final decision. Call LAST.
+- verify_documents(items) — Call FIRST. Pass {documents, policy_terms}.
+  If overall_valid=false → STOP. Return error immediately.
+- extract_documents(items) — Call ONLY if verification passed.
+- check_policy(items) — Call ONLY if extraction succeeded.
+- detect_fraud(items) — Call ONLY if policy check passed.
+- decide_claim(items) — Call LAST. Return its output.
 
 Important — Graceful Degradation:
 - If any tool call fails (returns an error), do NOT crash the pipeline.
@@ -72,12 +84,12 @@ Important — Graceful Degradation:
 - Pass the failure information downstream so the decision maker can lower confidence.
 - If simulate_component_failure is true in the input, one tool may fail intentionally — handle it gracefully.
 
-Data flow:
-1) verify_documents: pass the documents + policy_terms. If overall_valid=false → STOP, return error immediately with specific messages about what's wrong.
-2) extract_documents: pass documents with base64 images. Handle extraction failures gracefully.
-3) check_policy: pass {claim, member, extracted_data, policy_terms} for all policy checks.
+Data flow (only proceed if prior step succeeded):
+1) verify_documents: pass {documents, policy_terms}. If overall_valid=false → STOP. Return error.
+2) extract_documents: pass {documents, policy_terms}.
+3) check_policy: pass {claim, member, extracted_data, policy_terms}.
 4) detect_fraud: pass {member_id, claimed_amount, extracted_data, claim_history, policy_terms}.
-5) decide_claim: pass ALL outputs from steps 1-4 + original claim + policy_terms. Call LAST. Return its output.
+5) decide_claim: pass ALL outputs from steps 1-4 + claim + policy_terms. Call LAST.
 
 The input payload contains a "policy_terms" key with the full policy configuration.
 Use it everywhere — do NOT rely on hardcoded values.
@@ -116,40 +128,54 @@ async def process_claim(claim_data: Dict[str, Any]) -> Dict[str, Any]:
             member = m
             break
 
-    payload: dict = {
-        "claim": {
-            "claim_id": claim_id,
-            "member_id": claim_data.get("member_id"),
-            "policy_id": claim_data.get("policy_id"),
-            "claim_category": claim_data.get("claim_category"),
-            "treatment_date": claim_data.get("treatment_date"),
-            "claimed_amount": claim_data.get("claimed_amount"),
-            "hospital_name": claim_data.get("hospital_name"),
-        },
-        "documents": claim_data.get("documents", []),
-        "claim_history": claim_data.get("claims_history", []),
-        "member": member or {},
-        "policy_terms": policy_terms,
-    }
+    documents = list(claim_data.get("documents", []))
+    uploaded_file_ids: list[str] = []
 
-    if claim_data.get("simulate_component_failure"):
-        payload["simulate_component_failure"] = True
+    try:
+        for doc in documents:
+            b64 = doc.get("base64_content", "")
+            if b64 and is_pdf(b64):
+                raw = base64.b64decode(b64) if isinstance(b64, str) else b64
+                fid = await upload_file(raw)
+                uploaded_file_ids.append(fid)
+                doc["file_id"] = fid
 
-    _ensure_tracing()
+        claim_category = claim_data.get("claim_category", "")
+        payload: dict = {
+            "claim": {
+                "claim_id": claim_id,
+                "member_id": claim_data.get("member_id"),
+                "policy_id": claim_data.get("policy_id"),
+                "claim_category": claim_category,
+                "treatment_date": claim_data.get("treatment_date"),
+                "claimed_amount": claim_data.get("claimed_amount"),
+                "hospital_name": claim_data.get("hospital_name"),
+            },
+            "claim_category": claim_category,
+            "documents": documents,
+            "claim_history": claim_data.get("claims_history", []),
+            "member": member or {},
+            "policy_terms": policy_terms,
+        }
 
-    with trace("Health Insurance Claim Processing", group_id=claim_id):
-        logger.info("Processing claim: %s", claim_id)
+        if claim_data.get("simulate_component_failure"):
+            payload["simulate_component_failure"] = True
 
-        agent = build_agent()
-        try:
-            res = await Runner.run(
-                agent,
-                input=json.dumps(payload, ensure_ascii=False),
-                max_turns=15,
-                run_config=RunConfig(workflow_name="Health Insurance Claim Agent"),
-            )
-            result = getattr(res, "final_output", res)
-        except Exception as e:
+        _ensure_tracing()
+
+        with trace("Health Insurance Claim Processing", group_id=claim_id):
+            logger.info("Processing claim: %s", claim_id)
+
+            agent = build_agent()
+            try:
+                res = await Runner.run(
+                    agent,
+                    input=json.dumps(payload, ensure_ascii=False),
+                    max_turns=15,
+                    run_config=RunConfig(workflow_name="Health Insurance Claim Agent"),
+                )
+                result = getattr(res, "final_output", res)
+            except Exception as e:
                 logger.error("Agent pipeline failed for %s: %s", claim_id, e)
                 result = {
                     "claim_id": claim_id,
@@ -161,6 +187,10 @@ async def process_claim(claim_data: Dict[str, Any]) -> Dict[str, Any]:
                     "line_item_breakdown": None,
                     "degradation_notes": [f"Pipeline failed: {e}"],
                 }
+
+    finally:
+        for fid in uploaded_file_ids:
+            await delete_uploaded_file(fid)
 
     if isinstance(result, ClaimOut):
         output = result.model_dump()

@@ -1,40 +1,18 @@
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
+
+from agents import Agent, ModelSettings, Runner, function_tool
 from pydantic import BaseModel
-from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
+
+from .file_handlers import build_content_items
 
 logger = logging.getLogger("doc_verifier")
 
-CLASSIFY_VISION_PROMPT = """You are a medical document classifier. Analyze this document image and determine what type of medical document it is, and whether it is readable.
-
-Choose the single best matching type from:
-- PRESCRIPTION: A doctor's prescription or prescription slip listing medicines
-- HOSPITAL_BILL: A hospital, clinic, or medical bill/invoice with itemized charges
-- LAB_REPORT: A diagnostic lab test report with test results and values
-- PHARMACY_BILL: A pharmacy purchase receipt/bill for medicines
-- DISCHARGE_SUMMARY: A hospital discharge summary document
-- DENTAL_REPORT: A dental examination or treatment report
-- DIAGNOSTIC_REPORT: A diagnostic imaging report (X-ray, MRI, CT scan, ultrasound)
-
-Also assess readability:
-- "GOOD" if text is clearly legible and document details can be extracted
-- "UNREADABLE" if the image is blurry, too dark, overexposed, cropped, or text cannot be read
-
-Also extract the patient name visible on the document.
-
-Return valid JSON:
-{
-  "detected_type": "PRESCRIPTION",
-  "quality": "GOOD",
-  "patient_name": "Extracted Name or null",
-  "confidence": 0.95,
-  "reasoning": "This is a prescription because it lists medicines with dosage instructions and has a doctor's stamp"
-}"""
+DEFAULT_MODEL = os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini")
 
 
 class DocVerificationItem(BaseModel):
@@ -55,140 +33,107 @@ class DocVerificationOut(BaseModel):
     wrong_docs: List[str] = []
 
 
-def _ensure_image_base64(content: str) -> str:
-    """Convert PDF to PNG image if content is a PDF, otherwise return as-is."""
-    try:
-        import fitz
-        raw = base64.b64decode(content)
-        doc = fitz.open(stream=raw, filetype="pdf")
-        page = doc[0]
-        pix = page.get_pixmap(dpi=200)
-        img_bytes = pix.tobytes("png")
-        doc.close()
-        return base64.b64encode(img_bytes).decode()
-    except Exception:
-        return content
+SYSTEM_INSTRUCTIONS = """\
+You are DocumentVerifier. Examine each document image provided and classify it.
 
+The first text message tells you the claim_category, required document types,
+and optional document types. You MUST use this information.
 
-@function_tool
-async def classify_document_with_vision(base64_content: str) -> str:
-    """Analyze a medical document image and classify its type using vision AI."""
-    if not base64_content:
-        return json.dumps({"detected_type": "UNKNOWN", "patient_name": None, "confidence": 0.0, "reasoning": "No image data provided"})
+Step 1 — Classify each document:
+- Examine the image and classify the actual document type.
+- Choose the single best match from: PRESCRIPTION, HOSPITAL_BILL, LAB_REPORT,
+  PHARMACY_BILL, DISCHARGE_SUMMARY, DENTAL_REPORT, DIAGNOSTIC_REPORT.
+- Compare the actual type with the stated doc_type_hint. If they differ,
+  set type_mismatch=true and an error like:
+  "You uploaded a {actual_type} but labelled it as {doc_type_hint}."
+- Assess readability: "GOOD" if text is legible, "UNREADABLE" if not.
+- Extract the patient name visible on the document.
+- If quality is "UNREADABLE", mark valid=false with error:
+  "The document {filename} is unreadable. Please re-upload a clearer copy."
 
-    from openai import AsyncOpenAI
+Step 2 — Verify against requirements (CRITICAL):
+- The first text message states the claim_category, required[], and optional[].
+- Check that ALL required document types are present among the actual classifications.
+- If any required type is missing, add it to missing_docs.
+- If a document's type is NOT in required[] or optional[], add its filename to wrong_docs.
+- If patient names differ across documents, add an error on each mismatched doc.
 
-    image_content = _ensure_image_base64(base64_content)
+Step 3 — Set overall_valid:
+- overall_valid = true ONLY if ALL individual documents are valid
+  AND every required type is present (missing_docs must be empty).
+- Otherwise overall_valid = false.
 
-    try:
-        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        resp = await client.chat.completions.create(
-            model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": CLASSIFY_VISION_PROMPT},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_content}"}},
-                    ],
-                }
-            ],
-            temperature=0.1,
-            max_tokens=500,
-        )
-        raw = resp.choices[0].message.content or "{}"
-        raw = raw.strip()
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            raw = "\n".join(lines[1:-1])
-        return raw
-    except Exception as e:
-        return json.dumps({
-            "detected_type": "UNKNOWN",
-            "patient_name": None,
-            "quality": "UNREADABLE",
-            "confidence": 0.0,
-            "reasoning": f"Vision API error: {e}",
-        })
-
-
-INSTRUCTIONS = """
-You are DocumentVerifier. For each uploaded document you MUST:
-1. Classify its actual type by examining the image using classify_document_with_vision
-2. Compare the vision-detected type with the member-stated doc_type_hint
-3. Verify documents meet the policy requirements for the claim category
-
-Input includes:
-- documents: list of {transaction_uuid, filename, doc_type_hint, base64_content, quality, patient_name_on_doc}
-- policy_terms: dict containing document_requirements for each claim_category
-
-Steps:
-1) For each document that has base64_content, call classify_document_with_vision(base64_content)
-   to get the actual document type independently. Set vision_classification to the result.
-   Call it EXACTLY ONCE per document — if it returns low confidence or an error, use what you have
-   and move on. Do NOT retry. Set valid=false and include the error in the output.
-2) For documents WITHOUT base64_content, use doc_type_hint as detected_type and
-   do NOT set vision_classification or type_mismatch.
-3) Compare vision_classification with doc_type_hint. If they differ, set type_mismatch=true,
-   detected_type=vision_classification, and an error like:
-   "You uploaded a {vision_classification} but labelled it as {doc_type_hint}. Please check."
-4) Read the quality field from the vision classification result. If "UNREADABLE", mark valid=false with error:
-   "The document {filename} is unreadable. Please re-upload a clearer copy."
-   For docs without base64_content, use the input quality field as fallback.
-5) Read document_requirements for the claim_category from policy_terms. Verify ALL required
-   document types are present using the vision_classification (not doc_type_hint).
-6) If extra/wrong document types are uploaded that are not in required or optional for this
-   claim category, add them to wrong_docs.
-7) If patient names are available and differ across documents, mark with error:
-   "Documents have different patient names: found '{name1}' on {doc1} and '{name2}' on {doc2}."
-8) Return overall_valid=true ONLY if ALL documents pass AND all required docs are present.
-
-Final output JSON:
-{
-  "transactions": [
-    {
-      "transaction_uuid": "...",
-      "valid": true/false,
-      "detected_type": "PRESCRIPTION",
-      "vision_classification": "PRESCRIPTION",
-      "type_mismatch": true/false/null,
-      "quality": "GOOD",
-      "patient_name": "...",
-      "error": null or "specific error message"
-    }
-  ],
-  "overall_valid": true/false,
-  "missing_docs": ["HOSPITAL_BILL"],
-  "wrong_docs": ["PHARMACY_BILL"]
-}
+Return the output matching DocVerificationOut schema exactly.
 """
 
 
 @function_tool
-async def verify_documents(items: str) -> str:
+async def verify_documents(items: Any) -> str:
     return await _run_verification(items)
 
 
-async def _run_verification(items: str) -> str:
-    """Directly callable verification (not a function_tool)."""
-    raw = json.loads(items) if isinstance(items, str) else (items or {})
-    items_list = raw.get("documents", raw) if isinstance(raw, dict) else raw
+async def _run_verification(items: Any) -> str:
+    if isinstance(items, str):
+        raw = json.loads(items)
+    elif isinstance(items, dict):
+        raw = items
+    else:
+        raw = {}
+    doc_list: list[dict] = raw.get("documents", [])
+
+    claim_category = raw.get("claim_category") or raw.get("claim", {}).get("claim_category", "")
+    policy_terms = raw.get("policy_terms", {})
+    doc_reqs = policy_terms.get("document_requirements", {}).get(claim_category, {})
+
+    content_items: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": (
+                "=== CLAIM REQUIREMENTS ===\n"
+                f"Claim category: {claim_category}\n"
+                f"Required document types: {json.dumps(doc_reqs.get('required', []), ensure_ascii=False)}\n"
+                f"Optional document types: {json.dumps(doc_reqs.get('optional', []), ensure_ascii=False)}\n"
+                "=== END REQUIREMENTS ===\n\n"
+                "Classify each document image below."
+            ),
+        },
+    ]
+
+    for doc in doc_list:
+        label = (
+            f"Document: {doc.get('transaction_uuid', 'unknown')} — "
+            f"stated type: {doc.get('doc_type_hint', 'UNKNOWN')}, "
+            f"filename: {doc.get('filename', 'unknown')}"
+        )
+        file_id = doc.get("file_id", "")
+        base64_content = doc.get("base64_content", "")
+
+        if file_id:
+            items = await build_content_items(file_id=file_id, prefix_text=label)
+        elif base64_content:
+            items = await build_content_items(base64_content=base64_content, prefix_text=label)
+        else:
+            continue
+        content_items.extend(items)
+
+    if len(content_items) <= 1:
+        return json.dumps({
+            "transactions": [],
+            "overall_valid": False,
+            "missing_docs": [],
+            "wrong_docs": [],
+        })
 
     agent = Agent(
         name="DocumentVerifier",
-        instructions=INSTRUCTIONS,
-        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
-        tools=[classify_document_with_vision],
-        output_type=AgentOutputSchema(DocVerificationOut, strict_json_schema=False),
-        model_settings=ModelSettings(),
+        instructions=SYSTEM_INSTRUCTIONS,
+        model=DEFAULT_MODEL,
+        output_type=DocVerificationOut,
+        model_settings=ModelSettings(temperature=0.1),
     )
 
-    result = await Runner.run(
-        agent,
-        input=json.dumps(raw, ensure_ascii=False),
-        max_turns=3,
-    )
+    message = {"type": "message", "role": "user", "content": content_items}
+    result = await Runner.run(agent, [message])
+    verification = result.final_output_as(DocVerificationOut)
 
-    if isinstance(result.final_output, DocVerificationOut):
-        return result.final_output.model_dump_json()
-    return result.final_output
+    return verification.model_dump_json()

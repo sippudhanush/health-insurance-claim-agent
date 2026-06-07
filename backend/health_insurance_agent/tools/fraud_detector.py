@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
 from pydantic import BaseModel
 from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
 
@@ -51,8 +51,13 @@ Output JSON:
 
 
 @function_tool
-async def detect_fraud(items: str) -> str:
-    raw = json.loads(items) if isinstance(items, str) else (items or {})
+async def detect_fraud(items: Any) -> str:
+    if isinstance(items, str):
+        raw = json.loads(items)
+    elif isinstance(items, dict):
+        raw = items
+    else:
+        raw = {}
 
     agent = Agent(
         name="FraudDetector",

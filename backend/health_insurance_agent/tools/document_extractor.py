@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-import base64
 import json
-from typing import List, Optional
-from pydantic import BaseModel
-from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
-from openai import AsyncOpenAI
-import os
 import logging
+import os
+from typing import Any, List, Optional
+
+from agents import Agent, ModelSettings, Runner, function_tool
+from pydantic import BaseModel
+
+from .file_handlers import build_content_items
 
 logger = logging.getLogger("doc_extractor")
+
+DEFAULT_MODEL = os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini")
 
 
 class MedicineOut(BaseModel):
@@ -57,81 +60,45 @@ class ExtractionOut(BaseModel):
     documents: List[ExtractedDoc]
 
 
-EXTRACT_VISION_PROMPT = """Extract all fields from this medical document image.
-Return ALL fields you can find in JSON. Set unreadable fields to null.
-Add field names to low_confidence_fields if uncertain."""
+SYSTEM_INSTRUCTIONS = """\
+You are a meticulous medical document extraction agent.
+Examine each document image provided and extract all visible medical data.
 
+Rules:
+- Parse ONLY what is visibly printed on the document; do not invent values.
+- Dates must be in YYYY-MM-DD format when confidently readable.
+- Numbers are JSON numbers (not strings).
+- If a field is not visible or cannot be confidently extracted, set it to null.
+- For each document you process, return one ExtractedDoc entry.
 
-INSTRUCTIONS = """
-You are DocumentExtractor. Extract structured data from medical document images using vision AI.
-
-Input:
-- documents: list of {transaction_uuid, doc_type, base64_content}
-- You have one tool: extract_with_vision(base64_content, doc_type)
-
-For each document, call extract_with_vision ONCE which sends the image to OpenAI vision.
-If it returns an error, mark the doc with low confidence and move on. Do NOT retry.
-Merge results into the output schema based on doc_type:
+Field mapping by document type:
 - PRESCRIPTION → doctor_name, reg_no, patient_name, age, gender, date, diagnosis, medicines[], tests_ordered[]
 - HOSPITAL_BILL → hospital_name, bill_no, date, patient_name, line_items[], total_amount
-- LAB_REPORT → lab_name, patient_name, ref_doctor, sample_date, report_date, tests[]
+- LAB_REPORT → lab_name, patient_name, date, tests[] (each test: name, result, unit, normal_range)
 - PHARMACY_BILL → pharmacy_name, date, patient_name, doctor_name, medicines[], total_amount
+- DISCHARGE_SUMMARY → hospital_name, doctor_name, patient_name, date, diagnosis, medicines[], tests_ordered[], line_items[]
+- DENTAL_REPORT → doctor_name, patient_name, date, diagnosis, line_items[], total_amount
+- DIAGNOSTIC_REPORT → lab_name, patient_name, date, tests[] (each test: name, result, unit, normal_range)
 
-For unreadable fields set to null, add name to low_confidence_fields.
-Never fail whole doc because one field is unclear.
+For unreadable fields set to null, add the field name to low_confidence_fields.
+Never fail an entire document because one field is unclear.
+Set confidence between 0 and 1 reflecting overall extraction reliability.
+
+Important — sign preservation:
+Preserve the numeric sign exactly as printed for all numeric fields.
+Never drop a visible minus sign and never convert a negative value into absolute positive.
 """
 
 
-def _ensure_image_base64(content: str) -> str:
-    """Convert PDF to PNG image if content is a PDF, otherwise return as-is."""
-    try:
-        import fitz
-        raw = base64.b64decode(content)
-        doc = fitz.open(stream=raw, filetype="pdf")
-        page = doc[0]
-        pix = page.get_pixmap(dpi=200)
-        img_bytes = pix.tobytes("png")
-        doc.close()
-        return base64.b64encode(img_bytes).decode()
-    except Exception:
-        return content
-
-
 @function_tool
-async def extract_with_vision(base64_content: str, doc_type: str) -> str:
-    image_content = _ensure_image_base64(base64_content)
-    try:
-        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        resp = await client.chat.completions.create(
-            model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": EXTRACT_VISION_PROMPT},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_content}"}},
-                    ],
-                }
-            ],
-            temperature=0.1,
-        )
-        raw = resp.choices[0].message.content or "{}"
-        raw = raw.strip()
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            raw = "\n".join(lines[1:-1])
-        return raw
-    except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "confidence": 0.0,
-        })
-
-
-@function_tool
-async def extract_documents(items: str) -> str:
-    raw = json.loads(items) if isinstance(items, str) else (items or {})
-    items_list = raw.get("documents", raw) if isinstance(raw, dict) else raw
+async def extract_documents(items: Any) -> str:
+    if isinstance(items, str):
+        raw = json.loads(items)
+    elif isinstance(items, dict):
+        raw = items
+    else:
+        raw = {}
+    doc_list: list[dict] = raw.get("documents", [])
 
     if raw.get("simulate_component_failure"):
         logger.warning("Simulating document extraction failure (degraded)")
@@ -140,21 +107,42 @@ async def extract_documents(items: str) -> str:
             "degradation_notes": ["Document extraction component failed (simulated)"],
         })
 
+    content_items: list[dict[str, Any]] = [
+        {"type": "input_text", "text": "Extract structured medical data from the documents below."},
+    ]
+
+    for doc in doc_list:
+        label = (
+            f"Document: {doc.get('transaction_uuid', 'unknown')} — "
+            f"type: {doc.get('doc_type_hint', 'UNKNOWN')}"
+        )
+        file_id = doc.get("file_id", "")
+        base64_content = doc.get("base64_content", "")
+
+        if file_id:
+            items = await build_content_items(file_id=file_id, prefix_text=label)
+        elif base64_content:
+            items = await build_content_items(base64_content=base64_content, prefix_text=label)
+        else:
+            continue
+        content_items.extend(items)
+
+    if len(content_items) <= 1:
+        return json.dumps({
+            "documents": [],
+            "degradation_notes": ["No documents with base64 content provided"],
+        })
+
     agent = Agent(
         name="DocumentExtractor",
-        instructions=INSTRUCTIONS,
-        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
-        tools=[extract_with_vision],
-        output_type=AgentOutputSchema(ExtractionOut, strict_json_schema=False),
-        model_settings=ModelSettings(),
+        instructions=SYSTEM_INSTRUCTIONS,
+        model=DEFAULT_MODEL,
+        output_type=ExtractionOut,
+        model_settings=ModelSettings(temperature=0.1),
     )
 
-    result = await Runner.run(
-        agent,
-        input=json.dumps(raw, ensure_ascii=False),
-        max_turns=3,
-    )
+    message = {"type": "message", "role": "user", "content": content_items}
+    result = await Runner.run(agent, [message])
+    extraction = result.final_output_as(ExtractionOut)
 
-    if isinstance(result.final_output, ExtractionOut):
-        return result.final_output.model_dump_json()
-    return result.final_output
+    return extraction.model_dump_json()
