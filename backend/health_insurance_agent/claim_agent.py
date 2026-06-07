@@ -69,7 +69,7 @@ Call verify_documents FIRST. It classifies each uploaded document and returns:
 - required_docs: list of document types needed for this claim category
 - optional_docs: list of optional document types
 
-Look at the "policy_terms" (already in your input) to find what's required.
+Look at the "policy_terms" (already in your input) to find what's required based on the claim category.
 Then compare the detected_type from each transaction against the required_docs list.
 
 If ANY required document type is missing from the detected types → STOP immediately.

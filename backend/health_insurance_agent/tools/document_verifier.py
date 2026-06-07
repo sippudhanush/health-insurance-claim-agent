@@ -28,6 +28,10 @@ class DocVerificationItem(BaseModel):
     error: Optional[str] = None
 
 
+class DocBatchOutput(BaseModel):
+    transactions: List[DocVerificationItem]
+
+
 class DocVerificationOut(BaseModel):
     transactions: List[DocVerificationItem]
     required_docs: List[str] = []
@@ -35,15 +39,17 @@ class DocVerificationOut(BaseModel):
 
 
 CLASSIFY_INSTRUCTION = """\
-Classify this single document image.
+Classify each document image below.
 
-Always output:
-- transaction_uuid: "{tid}"
+For every document, output a single DocVerificationItem with:
+- transaction_uuid: the document's uuid
 - detected_type: one of PRESCRIPTION, HOSPITAL_BILL, LAB_REPORT, PHARMACY_BILL, DISCHARGE_SUMMARY, DENTAL_REPORT, DIAGNOSTIC_REPORT
-- type_mismatch: true if the actual document type differs from the stated type "{hint}"
+- type_mismatch: true if the actual document type differs from the stated type
 - patient_name: the patient name visible on the document (or null if unclear)
 - valid: false only if UNREADABLE or the document content doesn't match its expected type
 - error: brief explanation if valid=false, else null
+
+Documents to classify (in order):
 """
 
 
@@ -66,33 +72,36 @@ async def _run_verification(items: ToolInput) -> str:
         name="DocClassifier",
         instructions=CLASSIFY_INSTRUCTION,
         model=CLAIM_AGENT_MODEL,
-        output_type=DocVerificationItem,
+        output_type=DocBatchOutput,
         model_settings=ModelSettings(temperature=0.1),
     )
 
-    transactions: list[DocVerificationItem] = []
+    content: list[dict[str, Any]] = [
+        {"type": "input_text", "text": CLASSIFY_INSTRUCTION},
+    ]
+    doc_descriptions: list[str] = []
     for doc in doc_list:
         tid = doc.get("transaction_uuid", "unknown")
         hint = doc.get("doc_type_hint", "UNKNOWN")
         fname = doc.get("filename", "unknown")
+        doc_descriptions.append(f"  - {fname} (uuid: {tid}, stated type: {hint})")
 
-        instruction_text = CLASSIFY_INSTRUCTION.format(tid=tid, hint=hint)
-        content: list[dict[str, Any]] = [
-            {"type": "input_text", "text": instruction_text},
-        ]
         file_id = doc.get("file_id", "")
         base64_content = doc.get("base64_content", "")
         if file_id:
             content.extend(await build_content_items(file_id=file_id))
         elif base64_content:
             content.extend(await build_content_items(base64_content=base64_content))
-        else:
-            continue
 
-        msg = {"type": "message", "role": "user", "content": content}
-        result = await Runner.run(doc_agent, [msg])
-        item = result.final_output_as(DocVerificationItem)
-        transactions.append(item)
+    content[0] = {
+        "type": "input_text",
+        "text": CLASSIFY_INSTRUCTION + "\n".join(doc_descriptions),
+    }
+
+    msg = {"type": "message", "role": "user", "content": content}
+    result = await Runner.run(doc_agent, [msg])
+    batch = result.final_output_as(DocBatchOutput)
+    transactions = batch.transactions
 
     out = DocVerificationOut(
         transactions=transactions,
