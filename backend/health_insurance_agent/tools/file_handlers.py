@@ -47,7 +47,7 @@ def is_pdf(content: str) -> bool:
         return False
 
 
-def pdf_first_page_as_image(content: str, dpi: int = 200) -> str:
+def pdf_first_page_as_image(content: str, dpi: int = 120) -> str:
     raw = base64.b64decode(content)
     doc = fitz.open(stream=raw, filetype="pdf")
     page = doc[0]

@@ -35,7 +35,7 @@ Input includes:
 - simulate_component_failure (optional): if true, one component may have degraded
 
 Decision rules:
-- REJECTED if: verification.overall_valid == false, OR policy.eligible == false (and no line items were approved)
+- REJECTED if: policy.eligible == false (and no line items were approved)
 - PARTIAL if: policy_result has line_item_breakdown where some items approved and some rejected (e.g. cosmetic exclusion)
 - APPROVED if: all checks pass, fraud score < threshold, amount within limits
 - MANUAL_REVIEW if: fraud.manual_review_required == true, OR fraud.fraud_score >= threshold, OR claimed_amount > auto_manual_review_above

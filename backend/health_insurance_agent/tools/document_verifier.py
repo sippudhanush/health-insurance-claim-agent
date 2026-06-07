@@ -32,42 +32,20 @@ class DocVerificationItem(BaseModel):
 
 class DocVerificationOut(BaseModel):
     transactions: List[DocVerificationItem]
-    overall_valid: bool
-    missing_docs: List[str] = []
-    wrong_docs: List[str] = []
+    required_docs: List[str] = []
+    optional_docs: List[str] = []
 
 
-SYSTEM_INSTRUCTIONS = """\
-You are DocumentVerifier. Examine each document image provided and classify it.
+CLASSIFY_INSTRUCTION = """\
+Classify this single document image.
 
-The first text message tells you the claim_category, required document types,
-and optional document types. You MUST use this information.
-
-Step 1 — Classify each document:
-- Examine the image and classify the actual document type.
-- Choose the single best match from: PRESCRIPTION, HOSPITAL_BILL, LAB_REPORT,
-  PHARMACY_BILL, DISCHARGE_SUMMARY, DENTAL_REPORT, DIAGNOSTIC_REPORT.
-- Compare the actual type with the stated doc_type_hint. If they differ,
-  set type_mismatch=true and an error like:
-  "You uploaded a {actual_type} but labelled it as {doc_type_hint}."
-- Assess readability: "GOOD" if text is legible, "UNREADABLE" if not.
-- Extract the patient name visible on the document.
-- If quality is "UNREADABLE", mark valid=false with error:
-  "The document {filename} is unreadable. Please re-upload a clearer copy."
-
-Step 2 — Verify against requirements (CRITICAL):
-- The first text message states the claim_category, required[], and optional[].
-- Check that ALL required document types are present among the actual classifications.
-- If any required type is missing, add it to missing_docs.
-- If a document's type is NOT in required[] or optional[], add its filename to wrong_docs.
-- If patient names differ across documents, add an error on each mismatched doc.
-
-Step 3 — Set overall_valid:
-- overall_valid = true ONLY if ALL individual documents are valid
-  AND every required type is present (missing_docs must be empty).
-- Otherwise overall_valid = false.
-
-Return the output matching DocVerificationOut schema exactly.
+Always output:
+- transaction_uuid: "{tid}"
+- detected_type: one of PRESCRIPTION, HOSPITAL_BILL, LAB_REPORT, PHARMACY_BILL, DISCHARGE_SUMMARY, DENTAL_REPORT, DIAGNOSTIC_REPORT
+- type_mismatch: true if the actual document type differs from the stated type "{hint}"
+- patient_name: the patient name visible on the document (or null if unclear)
+- valid: false only if UNREADABLE or the document content doesn't match its expected type
+- error: brief explanation if valid=false, else null
 """
 
 
@@ -83,56 +61,44 @@ async def _run_verification(items: ToolInput) -> str:
     claim_category = raw.get("claim_category") or raw.get("claim", {}).get("claim_category", "")
     policy_terms = raw.get("policy_terms", {})
     doc_reqs = policy_terms.get("document_requirements", {}).get(claim_category, {})
+    required = doc_reqs.get("required", [])
+    optional = doc_reqs.get("optional", [])
 
-    content_items: list[dict[str, Any]] = [
-        {
-            "type": "input_text",
-            "text": (
-                "=== CLAIM REQUIREMENTS ===\n"
-                f"Claim category: {claim_category}\n"
-                f"Required document types: {json.dumps(doc_reqs.get('required', []), ensure_ascii=False)}\n"
-                f"Optional document types: {json.dumps(doc_reqs.get('optional', []), ensure_ascii=False)}\n"
-                "=== END REQUIREMENTS ===\n\n"
-                "Classify each document image below."
-            ),
-        },
-    ]
-
-    for doc in doc_list:
-        label = (
-            f"Document: {doc.get('transaction_uuid', 'unknown')} — "
-            f"stated type: {doc.get('doc_type_hint', 'UNKNOWN')}, "
-            f"filename: {doc.get('filename', 'unknown')}"
-        )
-        file_id = doc.get("file_id", "")
-        base64_content = doc.get("base64_content", "")
-
-        if file_id:
-            items = await build_content_items(file_id=file_id, prefix_text=label)
-        elif base64_content:
-            items = await build_content_items(base64_content=base64_content, prefix_text=label)
-        else:
-            continue
-        content_items.extend(items)
-
-    if len(content_items) <= 1:
-        return json.dumps({
-            "transactions": [],
-            "overall_valid": False,
-            "missing_docs": [],
-            "wrong_docs": [],
-        })
-
-    agent = Agent(
-        name="DocumentVerifier",
-        instructions=SYSTEM_INSTRUCTIONS,
+    doc_agent = Agent(
+        name="DocClassifier",
+        instructions=CLASSIFY_INSTRUCTION,
         model=DEFAULT_MODEL,
-        output_type=DocVerificationOut,
+        output_type=DocVerificationItem,
         model_settings=ModelSettings(temperature=0.1),
     )
 
-    message = {"type": "message", "role": "user", "content": content_items}
-    result = await Runner.run(agent, [message])
-    verification = result.final_output_as(DocVerificationOut)
+    transactions: list[DocVerificationItem] = []
+    for doc in doc_list:
+        tid = doc.get("transaction_uuid", "unknown")
+        hint = doc.get("doc_type_hint", "UNKNOWN")
+        fname = doc.get("filename", "unknown")
 
-    return verification.model_dump_json()
+        instruction_text = CLASSIFY_INSTRUCTION.format(tid=tid, hint=hint)
+        content: list[dict[str, Any]] = [
+            {"type": "input_text", "text": instruction_text},
+        ]
+        file_id = doc.get("file_id", "")
+        base64_content = doc.get("base64_content", "")
+        if file_id:
+            content.extend(await build_content_items(file_id=file_id))
+        elif base64_content:
+            content.extend(await build_content_items(base64_content=base64_content))
+        else:
+            continue
+
+        msg = {"type": "message", "role": "user", "content": content}
+        result = await Runner.run(doc_agent, [msg])
+        item = result.final_output_as(DocVerificationItem)
+        transactions.append(item)
+
+    out = DocVerificationOut(
+        transactions=transactions,
+        required_docs=required,
+        optional_docs=optional,
+    )
+    return out.model_dump_json()
