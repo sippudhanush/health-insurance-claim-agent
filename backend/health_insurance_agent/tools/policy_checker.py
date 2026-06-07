@@ -57,7 +57,7 @@ Run these checks using values from policy_terms — do NOT hardcode:
 
 5) PRE-AUTHORIZATION: If tests_ordered include MRI/CT/PET and amount > pre_auth_threshold from category config, require pre-auth. Reject with PRE_AUTH_MISSING.
 
-6) NETWORK HOSPITAL: Check hospital_name against policy_terms.network_hospitals. Set network_discount_percent if found.
+6) NETWORK HOSPITAL: Compare hospital_name EXACTLY against the policy_terms.network_hospitals list. Do NOT infer or assume a hospital is in-network. If the name does not appear verbatim in the list, set network_discount_percent = 0.
 
 7) CO-PAY: Read copay_percent from category config. Apply network discount BEFORE co-pay.
 

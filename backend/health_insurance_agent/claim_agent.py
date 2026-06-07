@@ -137,6 +137,27 @@ Data flow (only proceed if prior step succeeded):
 The input payload contains a "policy_terms" key with the full policy configuration.
 Use it everywhere — do NOT rely on hardcoded values.
 
+CRITICAL — PASS THE FULL policy_terms TO EVERY TOOL:
+When calling extract_documents, check_policy, detect_fraud, and decide_claim,
+you MUST pass the ENTIRE policy_terms object from the input payload.
+Do NOT truncate, summarize, or cherry-pick fields from policy_terms.
+The tools need the full policy to make correct decisions (exclusions, all categories, etc.).
+If you pass a partial policy_terms, the tools will make wrong decisions.
+
+MANDATORY — YOU MUST CALL THE FULL PIPELINE:
+The ONLY cases where you may stop early and construct a ClaimOut yourself are rules A, B, and C above
+(missing documents, unreadable document, patient name mismatch).
+
+If rules A, B, and C all pass (all required docs present, valid, and names match), you MUST:
+  1. Call extract_documents — pass full policy_terms
+  2. Call check_policy — pass full policy_terms
+  3. Call detect_fraud — pass full policy_terms
+  4. Call decide_claim — pass full policy_terms
+
+Do NOT compute approved_amount or decision yourself — the tools have access to vision models,
+fraud detection logic, and structured policy computations that you do not have.
+Even if you think you know the answer, you MUST still call every tool.
+
 Return ONLY the final output from decide_claim (or ClaimOut if stopped early).
 """
 

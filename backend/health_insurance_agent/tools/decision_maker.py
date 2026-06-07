@@ -35,6 +35,11 @@ Input includes:
 - policy_terms: full policy configuration
 - simulate_component_failure (optional): if true, one component may have degraded
 
+IMPORTANT — Trust the policy checker's line_item_breakdown.
+Do NOT re-evaluate or second-guess which line items are covered.
+The policy checker has already determined eligibility for each line item.
+Use its approved items as the basis for the approved amount.
+
 Decision rules:
 - REJECTED if: policy.eligible == false (and no line items were approved)
 - PARTIAL if: policy_result has line_item_breakdown where some items approved and some rejected (e.g. cosmetic exclusion)

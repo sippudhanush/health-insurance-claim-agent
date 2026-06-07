@@ -62,8 +62,14 @@ async def _run_verification(items: ToolInput) -> str:
     raw = items.model_dump() if not isinstance(items, dict) else items
     doc_list: list[dict] = raw.get("documents", [])
 
-    claim_category = raw.get("claim_category") or raw.get("claim", {}).get("claim_category", "")
     policy_terms = raw.get("policy_terms", {})
+    claim_category = (
+        raw.get("claim_category")
+        or raw.get("claim", {}).get("claim_category", "")
+        or policy_terms.get("claim_category", "")
+    )
+    if isinstance(policy_terms, dict) and "claim_category" in policy_terms:
+        policy_terms = {k: v for k, v in policy_terms.items() if k != "claim_category"}
     doc_reqs = policy_terms.get("document_requirements", {}).get(claim_category, {})
     required = doc_reqs.get("required", [])
     optional = doc_reqs.get("optional", [])
