@@ -6,13 +6,17 @@ import os
 from typing import Any, List, Optional
 
 from agents import Agent, ModelSettings, Runner, function_tool
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .file_handlers import build_content_items
 
 logger = logging.getLogger("doc_verifier")
 
 DEFAULT_MODEL = os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini")
+
+
+class ToolInput(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
 
 class DocVerificationItem(BaseModel):
@@ -67,18 +71,13 @@ Return the output matching DocVerificationOut schema exactly.
 """
 
 
-@function_tool
-async def verify_documents(items: Any) -> str:
+@function_tool(strict_mode=False)
+async def verify_documents(items: ToolInput) -> str:
     return await _run_verification(items)
 
 
-async def _run_verification(items: Any) -> str:
-    if isinstance(items, str):
-        raw = json.loads(items)
-    elif isinstance(items, dict):
-        raw = items
-    else:
-        raw = {}
+async def _run_verification(items: ToolInput) -> str:
+    raw = items.model_dump() if not isinstance(items, dict) else items
     doc_list: list[dict] = raw.get("documents", [])
 
     claim_category = raw.get("claim_category") or raw.get("claim", {}).get("claim_category", "")

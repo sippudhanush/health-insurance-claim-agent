@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, List, Optional
+from typing import List, Optional
 from pydantic import BaseModel
 from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
+from pydantic import ConfigDict
+
+
+class ToolInput(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
 
 class PolicyCheckItem(BaseModel):
@@ -72,14 +77,9 @@ Output JSON:
 """
 
 
-@function_tool
-async def check_policy(items: Any) -> str:
-    if isinstance(items, str):
-        raw = json.loads(items)
-    elif isinstance(items, dict):
-        raw = items
-    else:
-        raw = {}
+@function_tool(strict_mode=False)
+async def check_policy(items: ToolInput) -> str:
+    raw = items.model_dump() if not isinstance(items, dict) else items
 
     agent = Agent(
         name="PolicyChecker",

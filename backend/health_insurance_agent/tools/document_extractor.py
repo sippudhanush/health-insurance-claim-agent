@@ -6,13 +6,17 @@ import os
 from typing import Any, List, Optional
 
 from agents import Agent, ModelSettings, Runner, function_tool
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .file_handlers import build_content_items
 
 logger = logging.getLogger("doc_extractor")
 
 DEFAULT_MODEL = os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini")
+
+
+class ToolInput(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
 
 class MedicineOut(BaseModel):
@@ -90,14 +94,9 @@ Never drop a visible minus sign and never convert a negative value into absolute
 """
 
 
-@function_tool
-async def extract_documents(items: Any) -> str:
-    if isinstance(items, str):
-        raw = json.loads(items)
-    elif isinstance(items, dict):
-        raw = items
-    else:
-        raw = {}
+@function_tool(strict_mode=False)
+async def extract_documents(items: ToolInput) -> str:
+    raw = items.model_dump() if not isinstance(items, dict) else items
     doc_list: list[dict] = raw.get("documents", [])
 
     if raw.get("simulate_component_failure"):
