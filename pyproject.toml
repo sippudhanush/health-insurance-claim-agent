@@ -17,4 +17,9 @@ dependencies = [
 where = ["backend"]
 include = ["health_insurance_agent*"]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
 

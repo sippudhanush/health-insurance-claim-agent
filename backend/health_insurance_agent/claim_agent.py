@@ -134,9 +134,9 @@ Data flow (only proceed if prior step succeeded):
    - Required doc unreadable → STOP MANUAL_REVIEW.
    - patient_name mismatch → STOP MANUAL_REVIEW.
    - Proceed only if all required docs present, valid, names match.
-2) extract_documents(documents). Proceed only if success.
-3) check_policy(claim, member, extracted_data, policy_terms).
-4) detect_fraud(member_id, claimed_amount, extracted_data, claim_history, policy_terms).
+2) extract_documents(documents). Returns {"documents": [...]}. Save this entire result — it is the "extracted_data" for the next step.
+3) check_policy(claim, member, extracted_data, policy_terms). The "extracted_data" is the FULL output from extract_documents (the dict with documents list).
+4) detect_fraud(member_id, claimed_amount, extracted_data, claim_history, policy_terms, treatment_date).
 5) decide_claim(verification, extraction, policy_result, fraud_result, claim, policy_terms). Call LAST.
 
 policy_terms is in your input. Pass it to verify_documents, check_policy, detect_fraud, decide_claim.

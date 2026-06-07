@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import List, Optional
 from pydantic import BaseModel
 from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
 from pydantic import ConfigDict
 
 from health_insurance_agent.config import CLAIM_AGENT_MODEL
+
+POLICY_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "policy_terms.json"
 
 
 class ToolInput(BaseModel):
@@ -32,59 +35,57 @@ class PolicyCheckOut(BaseModel):
 INSTRUCTIONS = """
 You are PolicyChecker. Evaluate a claim against the provided policy_terms.
 
-Input includes:
-- claim: {member_id, claim_category, claimed_amount, treatment_date, hospital_name}
-- extracted_data: extracted document info (diagnosis, line_items[], total_amount, medicines[], ...)
-- member: {member_id, name, join_date, relationship, ...}
-- policy_terms: full policy configuration
+Input includes policy_terms, claim, extracted_data (contains line_items with description and amount), and member.
 
-Run these checks using values from policy_terms — do NOT hardcode.
+Do NOT compute the approved_amount_estimate yourself — leave it as null. The system will calculate it from your line_item_breakdown, network_discount_percent, and copay_percent.
 
-IMPORTANT: Always process check 4 (EXCLUSIONS) FIRST to determine which line items are approved vs excluded. Then use the approved amount for limit checks.
+Run these checks using the data in policy_terms:
 
-1) WAITING PERIOD: Compare join_date + treatment_date. Check initial_waiting_period_days. Check specific_conditions (diabetes=90d, etc.) if diagnosis matches. On failure, state eligibility date.
+1) EXCLUSIONS: Check each line item against exclusions lists. Build line_item_breakdown with approved:true/false.
 
-2) PER-CLAIM LIMIT: Read per_claim_limit from policy_terms.coverage. Compare the TOTAL claimed_amount against per_claim_limit. If claimed_amount > per_claim_limit, mark this check as FAILED and add "Claimed amount exceeds per-claim limit" to rejection_reasons. This check signals that the total claim is above the per-claim threshold, but do NOT use per_claim_limit as a cap on the approved amount.
+2) WAITING PERIOD: Compare member.join_date vs claim.treatment_date.
 
-3) SUB-LIMIT: Read category sub_limit from policy_terms.opd_categories[claim_category]. This is a CAP on the approved payout. First determine approved line items (check 4), then if the sum of approved items > sub_limit, cap the approved amount at sub_limit. Do NOT mark the claim ineligible just because the total claimed amount exceeds sub_limit.
+3) PER-CLAIM LIMIT: Compare claim.claimed_amount vs policy_terms.coverage.per_claim_limit.
 
-4) EXCLUSIONS — LINE-ITEM LEVEL (RUN THIS FIRST):
-   - Check EACH line item's description against exclusions:
-     - For DENTAL claims: check dental_exclusions list
-     - For VISION claims: check vision_exclusions list
-     - For all claims: check conditions list
-   - Build a line_item_breakdown: mark each item as approved:true or approved:false with reason
-   - Sum approved items' amounts as the baseline approved_amount_estimate (before applying limits)
-   - If some items excluded and some not, this is a PARTIAL approval — keep eligible=true but list rejection_reasons for excluded items
+4) PRE-AUTHORIZATION: Check if category requires pre-auth.
 
-5) PRE-AUTHORIZATION: If tests_ordered include MRI/CT/PET and amount > pre_auth_threshold from category config, require pre-auth. Reject with PRE_AUTH_MISSING.
+5) NETWORK HOSPITAL: Compare claim.hospital_name against policy_terms.network_hospitals list exactly. Set network_discount_percent from opd_categories if matched.
 
-6) NETWORK HOSPITAL: Compare hospital_name EXACTLY against the policy_terms.network_hospitals list. Do NOT infer or assume a hospital is in-network. If the name does not appear verbatim in the list, set network_discount_percent = 0.
+6) CO-PAY: Read copay_percent from opd_categories[claim.claim_category].copay_percent.
 
-7) CO-PAY: Read copay_percent from category config. Apply network discount BEFORE co-pay.
+7) SUB-LIMIT: Compare against sub_limit from opd_categories. Informational only — do NOT cap.
 
-8) APPROVED AMOUNT: Start from sum of approved line items. Apply network discount, then co-pay. Cap at sub_limit (check 3). The result is the final approved_amount_estimate.
-
-If at least one line item is approved, set eligible=true. Only set eligible=false if ALL line items are excluded/rejected or if a non-overridable check (like waiting period or pre-auth) fails.
-
-Return "PASSED", "FAILED", or "WAIVED" per check.
+Set eligible=true if at least one line item is approved.
 
 Output JSON:
-{
-  "eligible": true/false,
-  "approved_amount_estimate": <number|null>,
-  "checks": [{"check_name": "...", "status": "PASSED|FAILED|WAIVED", "detail": "..."}],
-  "network_discount_percent": <float>,
-  "copay_percent": <float>,
-  "rejection_reasons": ["<reason>", ...],
-  "line_item_breakdown": [{"description": "...", "amount": <float>, "approved": true/false, "reason": "..."}]
-}
+{"eligible": true/false, "approved_amount_estimate": null, "checks": [{"check_name": "...", "status": "PASSED|FAILED|WAIVED", "detail": "..."}], "network_discount_percent": <float>, "copay_percent": <float>, "rejection_reasons": ["..."], "line_item_breakdown": [{"description": "...", "amount": <float>, "approved": true/false, "reason": "..."}]}
 """
 
 
 @function_tool(strict_mode=False)
-async def check_policy(items: ToolInput) -> str:
-    raw = items.model_dump() if not isinstance(items, dict) else items
+async def check_policy(
+    claim: dict,
+    member: dict,
+    extracted_data: dict,
+    policy_terms: dict,
+) -> str:
+    raw = {
+        "claim": claim,
+        "member": member,
+        "extracted_data": extracted_data,
+        "policy_terms": policy_terms,
+    }
+
+    pt = raw.get("policy_terms", {})
+    if not pt or "opd_categories" not in pt:
+        with open(POLICY_PATH) as f:
+            full_pt = json.load(f)
+        raw["policy_terms"] = full_pt
+        if "member" in raw and raw["member"] and "member_id" in raw["member"]:
+            for m in full_pt.get("members", []):
+                if m.get("member_id") == raw["member"]["member_id"]:
+                    raw["member"] = m
+                    break
 
     agent = Agent(
         name="PolicyChecker",
@@ -101,5 +102,39 @@ async def check_policy(items: ToolInput) -> str:
     )
 
     if isinstance(result.final_output, PolicyCheckOut):
-        return result.final_output.model_dump_json()
+        out = result.final_output
+
+        approved_sum = 0.0
+        if out.line_item_breakdown:
+            for item in out.line_item_breakdown:
+                if item.get("approved"):
+                    approved_sum += float(item.get("amount", 0))
+        discount = float(out.network_discount_percent or 0)
+        copay = float(out.copay_percent or 0)
+        out.approved_amount_estimate = round(
+            approved_sum * (1 - discount / 100) * (1 - copay / 100), 2
+        )
+
+        claimed = float(raw.get("claim", {}).get("claimed_amount", 0))
+        per_claim_limit = float(
+            raw.get("policy_terms", {})
+            .get("coverage", {})
+            .get("per_claim_limit", 0)
+        )
+        sub_limit = float(
+            raw.get("policy_terms", {})
+            .get("opd_categories", {})
+            .get(raw.get("claim", {}).get("claim_category", ""), {})
+            .get("sub_limit", 0)
+        )
+        for c in out.checks:
+            cn = c.check_name.upper() if c.check_name else ""
+            if "PER-CLAIM" in cn:
+                c.status = "PASSED" if claimed <= per_claim_limit else "FAILED"
+                c.detail = f"Claimed {claimed} vs limit {per_claim_limit}"
+            if "SUB-LIMIT" in cn:
+                c.status = "PASSED"
+                c.detail = f"Amount {out.approved_amount_estimate} vs sub-limit {sub_limit} (informational)"
+
+        return out.model_dump_json()
     return result.final_output

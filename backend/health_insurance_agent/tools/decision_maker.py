@@ -54,6 +54,11 @@ Confidence scoring:
 - Deduct 0.1 if fraud_score > 0.5
 - Deduct 0.15 if degradation_notes is non-empty
 
+Reasoning guidelines:
+- State only the actual reason for the decision (e.g. "fraud detection flagged same-day claims", "sub-limit exceeded", etc.)
+- Do not claim data is missing or "not provided" — just describe what the data shows
+- Keep it concise (1-3 sentences)
+
 Output JSON:
 {
   "decision": "APPROVED|PARTIAL|REJECTED|MANUAL_REVIEW",
