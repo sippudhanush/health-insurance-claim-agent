@@ -1,100 +1,85 @@
 @startuml
 !theme plain
+
 skinparam backgroundColor #FEFEFE
+skinparam shadowing false
+skinparam roundcorner 8
 skinparam sequenceMessageAlign center
+skinparam ParticipantPadding 22
+skinparam BoxPadding 12
 
-title Health Insurance Claim Agent
+title Health Insurance Claim Agent - Simple System Flow
 
-actor Member as MEMBER
-actor "Ops Team" as OPS
+actor User
 
 box "Frontend" #E8F4FD
   participant "Streamlit UI" as UI
 end box
 
-box "Backend API" #F0E6FF
+box "Backend" #EEF2FF
   participant "FastAPI" as API
-  participant "Orchestrator" as ORCH
+  participant "Core Claim Agent" as AGENT
 end box
 
-box "Sub-Agents" #E8FFE8
-  participant "verify_documents" as V
-  participant "extract_documents" as E
-  participant "check_policy" as P
-  participant "detect_fraud" as F
-  participant "decide_claim" as D
+box "Agent Tools" #E8FFE8
+  participant "Document Verifier" as VERIFY
+  participant "Document Extractor" as EXTRACT
+  participant "Policy Checker" as POLICY
+  participant "Fraud Detector" as FRAUD
+  participant "Decision Maker" as DECIDE
 end box
 
-box "Infrastructure" #FFF3E0
-  entity "policy_terms.json" as POLICY
-  entity "OpenAI" as LLM
-  entity "Traces" as TRACES
+box "Data / AI Services" #FFF3E0
+  entity "policy_terms.json" as TERMS
+  participant "OpenAI" as OPENAI
+  participant "Traces" as TRACES
 end box
 
-== 1. Submit ==
-MEMBER -> UI: Upload docs + claim details
-UI -> API: POST /api/claims (base64 files)
-API -> ORCH: process_claim(payload)
+== Submit Claim ==
+User -> UI: Upload documents\nand claim details
+UI -> API: POST /api/claims
+API -> AGENT: Send claim payload
 
-== 2. Policy ==
-ORCH -> POLICY: Load policy_terms.json
-ORCH -> ORCH: Build payload with member + policy
+== Agent Starts ==
+AGENT -> TERMS: Load policy rules
+TERMS --> AGENT: Policy terms
 
-== 3. Agent Loop ==
-ORCH -> LLM: trace() + Runner.run()
-note right #F0E6FF
-  Orchestrator has 5 tools.
-  LLM decides call order.
-  Full trace sent to OpenAI.
+note right of AGENT
+  Core Claim Agent decides
+  which tool to call and when.
+  It can stop early if documents fail.
 end note
 
-ORCH -> V: 1. verify_documents
-note right #E8FFE8
-  Sub-agent classifies docs,
-  checks requirements from policy.
-end note
-V --> ORCH: valid, missing, wrong
+== Verify Documents ==
+AGENT -> VERIFY: Check uploaded documents
+VERIFY -> OPENAI: Classify document type\nand read patient name
+OPENAI --> VERIFY: Verification result
+VERIFY --> AGENT: Valid / missing / unreadable\nor name mismatch
 
-alt Failed
-  ORCH --> API: Error
-  API --> UI: Show specific error
-else Passed
+alt Documents failed
+  AGENT --> API: REJECTED or MANUAL_REVIEW
+  API --> UI: Show issue to user
+else Documents passed
+  AGENT -> EXTRACT: Extract medical and bill data
+  EXTRACT -> OPENAI: Read document contents
+  OPENAI --> EXTRACT: Extracted fields
+  EXTRACT --> AGENT: Patient, diagnosis,\nline items, total amount
+
+  AGENT -> POLICY: Check policy eligibility
+  POLICY -> TERMS: Use limits, exclusions,\nco-pay, network rules
+  TERMS --> POLICY: Policy rules
+  POLICY --> AGENT: Eligible amount\nand policy reasons
+
+  AGENT -> FRAUD: Detect fraud signals
+  FRAUD --> AGENT: Fraud score\nand review flag
+
+  AGENT -> DECIDE: Combine all results
+  DECIDE --> AGENT: APPROVED / PARTIAL /\nREJECTED / MANUAL_REVIEW
+
+  AGENT -> TRACES: Save agent/tool trace
+  AGENT --> API: Final decision JSON
+  API --> UI: Decision, amount,\nreasoning, breakdown
+  UI --> User: Show claim result
 end
-
-ORCH -> E: 2. extract_documents
-E -> LLM: Vision API (base64 images)
-LLM --> E: Patient, diagnosis, items, total
-E --> ORCH: extracted data
-
-ORCH -> P: 3. check_policy
-note right #E8FFE8
-  Waiting period, sub-limit,
-  exclusions, pre-auth,
-  network discount, co-pay.
-  Line-item level exclusion check.
-end note
-P --> ORCH: eligible, approved_amount, breakdown
-
-ORCH -> F: 4. detect_fraud
-F --> ORCH: fraud_score, signals
-
-ORCH -> D: 5. decide_claim
-D --> ORCH: Final decision + confidence
-
-== 4. Result ==
-ORCH --> API: Final JSON
-API --> UI: decision, amount, trace, breakdown
-
-alt Manual Review
-  UI --> OPS: Flagged for review
-  OPS -> API: GET /api/claims/{id}
-  API --> OPS: Full trace
-else Approved/Partial/Rejected
-  UI --> MEMBER: Show decision + reasoning
-end
-
-== 5. Traces ==
-OPS -> TRACES: View at platform.openai.com/traces
-UI -> UI: Show trace in expandable JSON
 
 @enduml
