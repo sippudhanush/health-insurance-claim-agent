@@ -110,12 +110,11 @@ C) After checking doc types, compare the "patient_name" field across ALL verifie
      Do NOT proceed to a claim decision.
 
 Tools:
-- verify_documents(items) — Call FIRST. Pass {documents, policy_terms, claim_category}.
+- verify_documents(items) — Call FIRST. Pass {documents, claim_category, policy_terms}.
   Returns classified docs + required_docs + optional_docs. YOU decide if requirements are met.
-- extract_documents(items) — Call ONLY if all required documents are present.
-- check_policy(items) — Call ONLY if extraction succeeded.
-- detect_fraud(items) — Call ONLY if policy check passed.
-- decide_claim(items) — Call LAST. Return its output directly as the final ClaimOut.
+- extract_documents(items) — Call only if all required docs present.
+- check_policy(items) — Call only if extraction succeeded.
+- decide_claim(items) — Call LAST. Return its output directly as final ClaimOut.
 
 Important — Graceful Degradation:
 - If any tool call fails (returns an error), do NOT crash the pipeline.
@@ -124,41 +123,21 @@ Important — Graceful Degradation:
 - If simulate_component_failure is true in the input, one tool may fail intentionally — handle it gracefully.
 
 Data flow (only proceed if prior step succeeded):
-1) verify_documents: pass {documents, policy_terms, claim_category}. Check returned transactions.
-   - If any required type is missing entirely → STOP with REJECTED.
-   - If any required doc is present but unreadable/invalid → STOP with MANUAL_REVIEW (re-upload request).
-   - If patient_name differs across transactions → STOP with MANUAL_REVIEW (name mismatch).
-   - Only proceed if all required docs are present, valid, AND patient names match.
-2) extract_documents: pass {documents, policy_terms}.
-3) check_policy: pass {claim, member, extracted_data, policy_terms}.
-4) detect_fraud: pass {member_id, claimed_amount, extracted_data, claim_history, policy_terms}.
-5) decide_claim: pass ALL outputs from steps 1-4 + claim + policy_terms. Call LAST.
+1) verify_documents(documents, claim_category). Check returned transactions.
+   - Required doc missing → STOP REJECTED.
+   - Required doc unreadable → STOP MANUAL_REVIEW.
+   - patient_name mismatch → STOP MANUAL_REVIEW.
+   - Proceed only if all required docs present, valid, names match.
+2) extract_documents(documents). Proceed only if success.
+3) check_policy(claim, member, extracted_data, policy_terms).
+4) detect_fraud(member_id, claimed_amount, extracted_data, claim_history, policy_terms).
+5) decide_claim(verification, extraction, policy_result, fraud_result, claim, policy_terms). Call LAST.
 
-The input payload contains a "policy_terms" key with the full policy configuration.
-Use it everywhere — do NOT rely on hardcoded values.
+policy_terms is in your input. Pass it to verify_documents, check_policy, detect_fraud, decide_claim.
 
-CRITICAL — PASS THE FULL policy_terms TO EVERY TOOL:
-When calling extract_documents, check_policy, detect_fraud, and decide_claim,
-you MUST pass the ENTIRE policy_terms object from the input payload.
-Do NOT truncate, summarize, or cherry-pick fields from policy_terms.
-The tools need the full policy to make correct decisions (exclusions, all categories, etc.).
-If you pass a partial policy_terms, the tools will make wrong decisions.
+If rules A, B, C all pass, you MUST call all 5 tools in sequence — do not skip.
 
-MANDATORY — YOU MUST CALL THE FULL PIPELINE:
-The ONLY cases where you may stop early and construct a ClaimOut yourself are rules A, B, and C above
-(missing documents, unreadable document, patient name mismatch).
-
-If rules A, B, and C all pass (all required docs present, valid, and names match), you MUST:
-  1. Call extract_documents — pass full policy_terms
-  2. Call check_policy — pass full policy_terms
-  3. Call detect_fraud — pass full policy_terms
-  4. Call decide_claim — pass full policy_terms
-
-Do NOT compute approved_amount or decision yourself — the tools have access to vision models,
-fraud detection logic, and structured policy computations that you do not have.
-Even if you think you know the answer, you MUST still call every tool.
-
-Return ONLY the final output from decide_claim (or ClaimOut if stopped early).
+Do NOT compute approved_amount or decision yourself. Return decide_claim's output directly.
 """
 
 

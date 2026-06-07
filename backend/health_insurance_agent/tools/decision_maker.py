@@ -40,11 +40,11 @@ Do NOT re-evaluate or second-guess which line items are covered.
 The policy checker has already determined eligibility for each line item.
 Use its approved items as the basis for the approved amount.
 
-Decision rules:
-- REJECTED if: policy.eligible == false (and no line items were approved)
-- PARTIAL if: policy_result has line_item_breakdown where some items approved and some rejected (e.g. cosmetic exclusion)
-- APPROVED if: all checks pass, fraud score < threshold, amount within limits
+Decision rules (evaluate in this order — first match wins):
 - MANUAL_REVIEW if: fraud.manual_review_required == true, OR fraud.fraud_score >= threshold, OR claimed_amount > auto_manual_review_above
+- PARTIAL if: policy_result has a line_item_breakdown where at least one item is approved:true AND at least one item is approved:false. This takes precedence over policy.eligible == false. The approved_amount should be the sum of approved line items after caps/limits from the policy checker.
+- APPROVED if: all items in line_item_breakdown are approved:true, all checks pass, amount within limits
+- REJECTED if: policy.eligible == false AND no line items are approved:true (i.e. ALL line items were rejected)
 
 Confidence scoring:
 - Start at 1.0

@@ -38,21 +38,23 @@ Input includes:
 - member: {member_id, name, join_date, relationship, ...}
 - policy_terms: full policy configuration
 
-Run these checks using values from policy_terms — do NOT hardcode:
+Run these checks using values from policy_terms — do NOT hardcode.
+
+IMPORTANT: Always process check 4 (EXCLUSIONS) FIRST to determine which line items are approved vs excluded. Then use the approved amount for limit checks.
 
 1) WAITING PERIOD: Compare join_date + treatment_date. Check initial_waiting_period_days. Check specific_conditions (diabetes=90d, etc.) if diagnosis matches. On failure, state eligibility date.
 
-2) PER-CLAIM LIMIT: Read per_claim_limit from policy_terms.coverage. If claimed_amount > per_claim_limit, reject with PER_CLAIM_EXCEEDED.
+2) PER-CLAIM LIMIT: Read per_claim_limit from policy_terms.coverage. Compare the TOTAL claimed_amount against per_claim_limit. If claimed_amount > per_claim_limit, mark this check as FAILED and add "Claimed amount exceeds per-claim limit" to rejection_reasons. This check signals that the total claim is above the per-claim threshold, but do NOT use per_claim_limit as a cap on the approved amount.
 
-3) SUB-LIMIT: Read category sub_limit from policy_terms.opd_categories[claim_category]. If claimed_amount > sub_limit, cap at sub_limit.
+3) SUB-LIMIT: Read category sub_limit from policy_terms.opd_categories[claim_category]. This is a CAP on the approved payout. First determine approved line items (check 4), then if the sum of approved items > sub_limit, cap the approved amount at sub_limit. Do NOT mark the claim ineligible just because the total claimed amount exceeds sub_limit.
 
-4) EXCLUSIONS — LINE-ITEM LEVEL:
+4) EXCLUSIONS — LINE-ITEM LEVEL (RUN THIS FIRST):
    - Check EACH line item's description against exclusions:
      - For DENTAL claims: check dental_exclusions list
      - For VISION claims: check vision_exclusions list
      - For all claims: check conditions list
    - Build a line_item_breakdown: mark each item as approved:true or approved:false with reason
-   - Sum approved items' amounts for the approved_amount_estimate
+   - Sum approved items' amounts as the baseline approved_amount_estimate (before applying limits)
    - If some items excluded and some not, this is a PARTIAL approval — keep eligible=true but list rejection_reasons for excluded items
 
 5) PRE-AUTHORIZATION: If tests_ordered include MRI/CT/PET and amount > pre_auth_threshold from category config, require pre-auth. Reject with PRE_AUTH_MISSING.
@@ -61,7 +63,9 @@ Run these checks using values from policy_terms — do NOT hardcode:
 
 7) CO-PAY: Read copay_percent from category config. Apply network discount BEFORE co-pay.
 
-8) APPROVED AMOUNT: Start from sum of approved line items. Apply network discount, then co-pay. Cap at sub_limit if needed.
+8) APPROVED AMOUNT: Start from sum of approved line items. Apply network discount, then co-pay. Cap at sub_limit (check 3). The result is the final approved_amount_estimate.
+
+If at least one line item is approved, set eligible=true. Only set eligible=false if ALL line items are excluded/rejected or if a non-overridable check (like waiting period or pre-auth) fails.
 
 Return "PASSED", "FAILED", or "WAIVED" per check.
 
