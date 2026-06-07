@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any, List, Optional
 
 from agents import Agent, ModelSettings, Runner, function_tool
@@ -11,6 +12,7 @@ from health_insurance_agent.config import CLAIM_AGENT_MODEL
 from .file_handlers import build_content_items
 
 logger = logging.getLogger("doc_verifier")
+POLICY_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "policy_terms.json"
 
 
 class ToolInput(BaseModel):
@@ -44,10 +46,17 @@ Classify each document image below.
 For every document, output a single DocVerificationItem with:
 - transaction_uuid: the document's uuid
 - detected_type: one of PRESCRIPTION, HOSPITAL_BILL, LAB_REPORT, PHARMACY_BILL, DISCHARGE_SUMMARY, DENTAL_REPORT, DIAGNOSTIC_REPORT
+- quality: "good" if the document content is readable, otherwise "unreadable" or "poor"
 - type_mismatch: true if the actual document type differs from the stated type
 - patient_name: the patient name visible on the document (or null if unclear)
-- valid: false only if UNREADABLE or the document content doesn't match its expected type
+- valid: false only if the document is unreadable/poor or the visible document content does not match its stated type
 - error: brief explanation if valid=false, else null
+
+Important:
+- Classify from the visible document content, not from policy requirements.
+- Never invent filenames or document types that were not provided in the input.
+- If a readable prescription is uploaded for a claim that also requires a hospital bill, still classify
+  that document as PRESCRIPTION and valid=true. Missing required document handling is done later.
 
 Documents to classify (in order):
 """
@@ -62,7 +71,7 @@ async def _run_verification(items: ToolInput) -> str:
     raw = items.model_dump() if not isinstance(items, dict) else items
     doc_list: list[dict] = raw.get("documents", [])
 
-    policy_terms = raw.get("policy_terms", {})
+    policy_terms = raw.get("policy_terms") or {}
     claim_category = (
         raw.get("claim_category")
         or raw.get("claim", {}).get("claim_category", "")
@@ -70,6 +79,9 @@ async def _run_verification(items: ToolInput) -> str:
     )
     if isinstance(policy_terms, dict) and "claim_category" in policy_terms:
         policy_terms = {k: v for k, v in policy_terms.items() if k != "claim_category"}
+    if not policy_terms.get("document_requirements"):
+        with open(POLICY_PATH) as f:
+            policy_terms = json.load(f)
     doc_reqs = policy_terms.get("document_requirements", {}).get(claim_category, {})
     required = doc_reqs.get("required", [])
     optional = doc_reqs.get("optional", [])

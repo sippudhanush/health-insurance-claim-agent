@@ -81,23 +81,41 @@ IMPORTANT — When checking required doc types, treat these as equivalent/interc
 - Also check each doc's original doc_type_hint when available. If the doc was uploaded as
   "LAB_REPORT" but classified as "DIAGNOSTIC_REPORT", it still counts as the required doc.
 
-Check each transaction's "valid" and "quality" fields:
+Required-document gate order:
+- First build the set of uploaded document types from each transaction's detected_type.
+- Also use doc_type_hint only for the equivalence rule above; do not use it to invent missing output.
+- Missing required documents take precedence over unreadable/poor-quality handling.
+- Only inspect unreadable/poor quality for a required document type after every required document type is present.
+- Ignore optional or extra documents when deciding the unreadable-document branch.
+
+Check each transaction's "valid" and "quality" fields only after missing required documents are handled:
 
 A) If a required document type is COMPLETELY MISSING (not found among the detected types
    or equivalent types) → STOP immediately. Do NOT call any other tool. Construct a ClaimOut with:
    - decision: "REJECTED"
+   - approved_amount: null
    - claim_id: from the input
    - confidence_score: 1.0
    - rejection_reasons: ["MISSING_DOCUMENTS"]
-   - reasoning: clearly state which required document types are missing and what was uploaded instead
+   - line_item_breakdown: null
+   - reasoning format:
+     "Required documents for <claim_category> are <required_doc_1> and <required_doc_2>. The uploaded documents were
+      classified as <detected_type> (<transaction_uuid>), ... . No <missing_doc_type> was provided,
+      so the claim cannot proceed. <All/Both uploaded documents were marked valid.>"
+   - Use plain English in reasoning; do not print JSON arrays like ["PRESCRIPTION","HOSPITAL_BILL"].
+   - Use document type tokens exactly as returned, in uppercase with underscores, such as PRESCRIPTION and HOSPITAL_BILL.
+   - In this branch, do NOT mention unreadable documents, re-upload requests, optional documents,
+     LAB_REPORT, or DIAGNOSTIC_REPORT unless they were actually uploaded and relevant to the missing set.
 
 B) If a required document type IS present but the specific doc is invalid/unreadable
    (valid=false, quality="unreadable"/"poor") → STOP immediately.
    Do NOT call any other tool. Construct a ClaimOut with:
    - decision: "MANUAL_REVIEW"
+   - approved_amount: null
    - claim_id: from the input
    - confidence_score: 0.5
    - rejection_reasons: ["UNREADABLE_DOCUMENT"]
+   - line_item_breakdown: null
    - reasoning: clearly state which document is unreadable and ask the member to re-upload it.
      Do NOT reject the claim outright — this is a re-upload request, not a denial.
 
@@ -106,9 +124,11 @@ C) After checking doc types, compare the "patient_name" field across ALL verifie
    the "member" key in your input). If any patient_name differs → STOP immediately.
    Do NOT call any other tool. Construct a ClaimOut with:
    - decision: "MANUAL_REVIEW"
+   - approved_amount: null
    - claim_id: from the input
    - confidence_score: 0.6
    - rejection_reasons: ["PATIENT_NAME_MISMATCH"]
+   - line_item_breakdown: null
    - reasoning: For each document that has a different patient_name, state:
        "The document '<filename>' shows patient name '<name_on_doc>', which does not
         match the member's name '<member_name>'. Please upload the correct document
