@@ -43,6 +43,7 @@ Use its approved items as the basis for the approved amount.
 Decision rules (evaluate in this order — first match wins):
 - MANUAL_REVIEW if: fraud.manual_review_required == true, OR fraud.fraud_score >= threshold, OR claimed_amount > auto_manual_review_above
 - PARTIAL if: policy_result has a line_item_breakdown where at least one item is approved:true AND at least one item is approved:false. This takes precedence over policy.eligible == false. The approved_amount should be the sum of approved line items after caps/limits from the policy checker.
+- REJECTED if: any FAILED check in policy_result.checks is a hard rejection check (PRE_AUTHORIZATION, WAITING_PERIOD, PER_CLAIM_LIMIT, EXCLUDED_CONDITION, INITIAL_WAITING_PERIOD, SUB_LIMIT_EXCEEDED). These override line-item approval status. Use the corresponding rejection_reasons from the failed checks.
 - APPROVED if: all items in line_item_breakdown are approved:true, all checks pass, amount within limits
 - REJECTED if: policy.eligible == false AND no line items are approved:true (i.e. ALL line items were rejected)
 
@@ -59,7 +60,7 @@ Output JSON:
   "approved_amount": <number|null>,
   "confidence_score": <0.0-1.0>,
   "rejection_reasons": ["<reason>", ...],
-  "reasoning": "<step-by-step reasoning explaining exactly why this decision was made>",
+  "reasoning": "<concise 1-2 sentence explanation of the decision and the main reason>",
   "line_item_breakdown": [{"description": "...", "amount": <float>, "approved": true/false, "reason": "..."}],
   "degradation_notes": ["<note>", ...]
 }
