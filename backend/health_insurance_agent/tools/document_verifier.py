@@ -2,17 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import Any, List, Optional
 
 from agents import Agent, ModelSettings, Runner, function_tool
 from pydantic import BaseModel, ConfigDict
 
+from health_insurance_agent.config import CLAIM_AGENT_MODEL
 from .file_handlers import build_content_items
 
 logger = logging.getLogger("doc_verifier")
-
-DEFAULT_MODEL = os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini")
 
 
 class ToolInput(BaseModel):
@@ -67,7 +65,7 @@ async def _run_verification(items: ToolInput) -> str:
     doc_agent = Agent(
         name="DocClassifier",
         instructions=CLASSIFY_INSTRUCTION,
-        model=DEFAULT_MODEL,
+        model=CLAIM_AGENT_MODEL,
         output_type=DocVerificationItem,
         model_settings=ModelSettings(temperature=0.1),
     )

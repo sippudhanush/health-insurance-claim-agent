@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import List, Optional
 from pydantic import BaseModel
 from agents import Agent, Runner, function_tool, ModelSettings, AgentOutputSchema
 from pydantic import ConfigDict
+
+from health_insurance_agent.config import CLAIM_AGENT_MODEL
 
 
 class ToolInput(BaseModel):
@@ -62,7 +63,7 @@ async def detect_fraud(items: ToolInput) -> str:
     agent = Agent(
         name="FraudDetector",
         instructions=INSTRUCTIONS,
-        model=os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini"),
+        model=CLAIM_AGENT_MODEL,
         output_type=AgentOutputSchema(FraudCheckOut, strict_json_schema=False),
         model_settings=ModelSettings(),
     )

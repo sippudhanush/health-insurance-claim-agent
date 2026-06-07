@@ -1,22 +1,18 @@
 import asyncio
 import json
-import os
 import sys
 import base64
 from pathlib import Path
 from datetime import datetime
 from fpdf import FPDF
-from dotenv import load_dotenv
-
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-load_dotenv(Path(__file__).parent.parent / ".env")
-
+from health_insurance_agent.config import OPENAI_API_KEY 
 from health_insurance_agent.claim_agent import process_claim
 
-TEST_CASES_PATH = Path(__file__).parent.parent / "Plum Assignment - 12-04-2026" / "test_cases.json"
-OUTPUT_DIR = Path(__file__).parent.parent / "Plum Assignment - 12-04-2026" / "pdf_reports"
+TEST_CASES_PATH = Path(__file__).parent.parent / "test_cases.json"
+OUTPUT_DIR = Path(__file__).parent.parent / "pdf_reports"
 ARIAL_PATH = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
 COURIER_PATH = "/System/Library/Fonts/Supplemental/Courier New.ttf"
 

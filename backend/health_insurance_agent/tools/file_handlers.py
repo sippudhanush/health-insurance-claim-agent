@@ -12,11 +12,13 @@ import fitz
 from PIL import Image
 from openai import AsyncOpenAI
 
+from health_insurance_agent.config import OPENAI_API_KEY
+
 logger = logging.getLogger("file_handlers")
 
 
 def get_openai_client() -> AsyncOpenAI:
-    return AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    return AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
 async def upload_file(raw_bytes: bytes, suffix: str = ".pdf") -> str:

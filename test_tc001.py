@@ -3,12 +3,12 @@
 import asyncio
 import base64
 import json
-import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "backend"))
 
+from health_insurance_agent.config import OPENAI_API_KEY  # noqa: F401 - loads .env
 from health_insurance_agent.claim_agent import process_claim
 
 TC001_DIR = Path(__file__).resolve().parent / "tests" / "fixtures" / "TC001_Wrong_Document_Uploaded"

@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -13,6 +12,7 @@ from agents.tracing import add_trace_processor
 from agents.tracing.processors import ConsoleSpanExporter, BatchTraceProcessor
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 
+from health_insurance_agent.config import CLAIM_AGENT_MODEL, CLAIM_AGENT_LOG_LEVEL
 from health_insurance_agent.tools.document_verifier import verify_documents
 from health_insurance_agent.tools.document_extractor import extract_documents
 from health_insurance_agent.tools.policy_checker import check_policy
@@ -29,9 +29,7 @@ if not logger.handlers:
     h = logging.StreamHandler()
     h.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logger.addHandler(h)
-logger.setLevel(os.getenv("CLAIM_AGENT_LOG_LEVEL", "INFO"))
-
-AGENT_MODEL = os.getenv("CLAIM_AGENT_MODEL", "gpt-4o-mini")
+logger.setLevel(CLAIM_AGENT_LOG_LEVEL)
 POLICY_PATH = Path(__file__).resolve().parent.parent / "data" / "policy_terms.json"
 
 _TRACING_SETUP = False
@@ -118,7 +116,7 @@ def build_agent() -> Agent:
     return Agent(
         name="HealthInsuranceClaimProcessor",
         instructions=instr,
-        model=AGENT_MODEL,
+        model=CLAIM_AGENT_MODEL,
         model_settings=ModelSettings(temperature=0.1),
         tools=[
             verify_documents,
