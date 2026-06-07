@@ -75,10 +75,16 @@ Call verify_documents FIRST. It classifies each uploaded document and returns:
 Look at the "policy_terms" (already in your input) to find what's required based on the claim category.
 Then compare the detected_type from each transaction against the required_docs list.
 
+IMPORTANT — When checking required doc types, treat these as equivalent/interchangeable:
+- "LAB_REPORT" and "DIAGNOSTIC_REPORT" are the same thing. If required_docs lists "LAB_REPORT"
+  and a doc has detected_type "DIAGNOSTIC_REPORT", it counts as present.
+- Also check each doc's original doc_type_hint when available. If the doc was uploaded as
+  "LAB_REPORT" but classified as "DIAGNOSTIC_REPORT", it still counts as the required doc.
+
 Check each transaction's "valid" and "quality" fields:
 
 A) If a required document type is COMPLETELY MISSING (not found among the detected types
-   at all) → STOP immediately. Do NOT call any other tool. Construct a ClaimOut with:
+   or equivalent types) → STOP immediately. Do NOT call any other tool. Construct a ClaimOut with:
    - decision: "REJECTED"
    - claim_id: from the input
    - confidence_score: 1.0
