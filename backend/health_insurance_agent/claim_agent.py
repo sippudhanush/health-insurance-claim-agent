@@ -72,16 +72,25 @@ Call verify_documents FIRST. It classifies each uploaded document and returns:
 Look at the "policy_terms" (already in your input) to find what's required based on the claim category.
 Then compare the detected_type from each transaction against the required_docs list.
 
-If ANY required document type is missing from the detected types → STOP immediately.
-Do NOT call any other tool. Construct a ClaimOut with:
-- decision: "REJECTED"
-- claim_id: from the input
-- confidence_score: 1.0
-- rejection_reasons: ["MISSING_DOCUMENTS"]
-- reasoning: clearly state which required document types are missing and what was uploaded instead
+Check each transaction's "valid" and "quality" fields:
 
-Also check each transaction's "valid" field. If any doc is invalid (unreadable/wrong content),
-explain in reasoning what's wrong with it.
+A) If a required document type is COMPLETELY MISSING (not found among the detected types
+   at all) → STOP immediately. Do NOT call any other tool. Construct a ClaimOut with:
+   - decision: "REJECTED"
+   - claim_id: from the input
+   - confidence_score: 1.0
+   - rejection_reasons: ["MISSING_DOCUMENTS"]
+   - reasoning: clearly state which required document types are missing and what was uploaded instead
+
+B) If a required document type IS present but the specific doc is invalid/unreadable
+   (valid=false, quality="unreadable"/"poor") → STOP immediately.
+   Do NOT call any other tool. Construct a ClaimOut with:
+   - decision: "MANUAL_REVIEW"
+   - claim_id: from the input
+   - confidence_score: 0.5
+   - rejection_reasons: ["UNREADABLE_DOCUMENT"]
+   - reasoning: clearly state which document is unreadable and ask the member to re-upload it.
+     Do NOT reject the claim outright — this is a re-upload request, not a denial.
 
 Tools:
 - verify_documents(items) — Call FIRST. Pass {documents, policy_terms, claim_category}.
@@ -98,7 +107,10 @@ Important — Graceful Degradation:
 - If simulate_component_failure is true in the input, one tool may fail intentionally — handle it gracefully.
 
 Data flow (only proceed if prior step succeeded):
-1) verify_documents: pass {documents, policy_terms, claim_category}. Check returned transactions against required_docs. If any required type is missing → STOP with REJECTED.
+1) verify_documents: pass {documents, policy_terms, claim_category}. Check returned transactions against required_docs.
+   - If any required type is missing entirely → STOP with REJECTED.
+   - If any required doc is present but unreadable/invalid → STOP with MANUAL_REVIEW (re-upload request).
+   - Only proceed if all required docs are present AND valid.
 2) extract_documents: pass {documents, policy_terms}.
 3) check_policy: pass {claim, member, extracted_data, policy_terms}.
 4) detect_fraud: pass {member_id, claimed_amount, extracted_data, claim_history, policy_terms}.
